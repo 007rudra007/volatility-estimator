@@ -1,0 +1,17 @@
+# Dynamic Volatility Estimator - India
+# Python 3.9+ required
+
+# Data Ingestion
+yfinance>=0.2.36
+
+# Core Computation
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Statistical Modeling
+scipy>=1.11.0
+arch>=6.2.0
+
+# Dashboard & Visualization
+streamlit>=1.30.0
+plotly>=5.18.0
