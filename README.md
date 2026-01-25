@@ -36,7 +36,7 @@ A **quant-grade realized volatility dashboard** for Indian equity markets (NSE/B
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/volatility-estimator.git
+git clone https://github.com/007rudra007/volatility-estimator.git
 cd volatility-estimator
 
 # Install dependencies
