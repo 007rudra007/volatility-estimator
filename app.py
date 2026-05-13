@@ -474,6 +474,34 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         st.divider()
 
         # ------------------------------------------------------------------
+        # GARCH(1,1) Forecast  (shown above charts for forward-looking context)
+        # ------------------------------------------------------------------
+        if show_garch:
+            st.markdown("### GARCH(1,1) Volatility Forecast")
+
+            with st.spinner("Fitting GARCH model..."):
+                garch_result = fit_garch(metrics['Log_Ret'])
+
+            if garch_result:
+                gcol1, gcol2, gcol3, gcol4 = st.columns(4)
+
+                with gcol1:
+                    st.metric("α (Shock Reaction)",  f"{garch_result['alpha']:.4f}"      if garch_result['alpha']       else "N/A")
+                with gcol2:
+                    st.metric("β (Persistence)",      f"{garch_result['beta']:.4f}"       if garch_result['beta']        else "N/A")
+                with gcol3:
+                    st.metric("Persistence (α+β)",    f"{garch_result['persistence']:.4f}" if garch_result['persistence'] else "N/A")
+                with gcol4:
+                    st.metric("1-Day Forecast",        f"{garch_result['forecast_1d']:.1%}" if garch_result['forecast_1d'] else "N/A")
+
+                if garch_result['persistence'] and garch_result['persistence'] > 0.95:
+                    st.warning("⚠️ High persistence — volatility shocks are slow to decay.")
+            else:
+                st.warning("GARCH model could not be fitted. Try a longer data period.")
+
+            st.divider()
+
+        # ------------------------------------------------------------------
         # Main Volatility Chart - Quant Style
         # ------------------------------------------------------------------
         st.markdown("### PRICE & VOLATILITY")
@@ -568,31 +596,6 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         
         st.plotly_chart(fig, use_container_width=True)
         
-        # ------------------------------------------------------------------
-        # GARCH Analysis (Optional)
-        # ------------------------------------------------------------------
-        if show_garch:
-            st.markdown("### GARCH(1,1) Volatility Forecast")
-            
-            with st.spinner("Fitting GARCH model..."):
-                garch_result = fit_garch(metrics['Log_Ret'])
-            
-            if garch_result:
-                gcol1, gcol2, gcol3, gcol4 = st.columns(4)
-                
-                with gcol1:
-                    st.metric("α (Shock Reaction)", f"{garch_result['alpha']:.4f}" if garch_result['alpha'] else "N/A")
-                with gcol2:
-                    st.metric("β (Persistence)", f"{garch_result['beta']:.4f}" if garch_result['beta'] else "N/A")
-                with gcol3:
-                    st.metric("Persistence (α+β)", f"{garch_result['persistence']:.4f}" if garch_result['persistence'] else "N/A")
-                with gcol4:
-                    st.metric("1-Day Forecast", f"{garch_result['forecast_1d']:.1%}" if garch_result['forecast_1d'] else "N/A")
-                
-                if garch_result['persistence'] and garch_result['persistence'] > 0.95:
-                    st.warning("⚠️ High persistence indicates volatility shocks last a long time!")
-            else:
-                st.warning("GARCH model could not be fitted. Try a longer data period.")
         
         # ------------------------------------------------------------------
         # Event Impact Analysis
