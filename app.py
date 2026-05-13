@@ -314,7 +314,7 @@ def fetch_intraday_hl(ticker: str) -> dict:
     except Exception as e:
         return None
 
-def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame) -> dict:
+def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame, current_price: float = None) -> dict:
     """
     Derive statistical price targets from realized vol, ATR, and Bollinger Bands.
     All levels are based purely on price/vol data — no fundamental inputs.
@@ -322,7 +322,7 @@ def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame) -> dict:
     close   = data['Close'].dropna()
     high    = data['High'].dropna()
     low     = data['Low'].dropna()
-    last    = float(close.iloc[-1])
+    last    = current_price if current_price is not None else float(close.iloc[-1])
 
     # --- 1. Vol-based lognormal bands (±1σ, ±2σ daily move) ---
     vol_col = next((c for c in ['Vol_20d', 'Vol_20', 'EWMA'] if c in metrics.columns), None)
@@ -571,7 +571,8 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         st.markdown("### 🎯 Statistical Price Targets")
         st.caption("Derived from realized volatility, ATR-14, and Bollinger Bands — no fundamental inputs.")
 
-        pt = calculate_price_targets(full_data, metrics)
+        current_p = hl['close'] if 'hl' in locals() and hl else None
+        pt = calculate_price_targets(full_data, metrics, current_price=current_p)
         last = pt['last']
 
         # ---- Metric cards row 1: Vol-based bands ----
