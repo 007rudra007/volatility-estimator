@@ -314,6 +314,70 @@ def fetch_intraday_hl(ticker: str) -> dict:
     except Exception as e:
         return None
 
+def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame) -> dict:
+    """
+    Derive statistical price targets from realized vol, ATR, and Bollinger Bands.
+    All levels are based purely on price/vol data — no fundamental inputs.
+    """
+    close   = data['Close'].dropna()
+    high    = data['High'].dropna()
+    low     = data['Low'].dropna()
+    last    = float(close.iloc[-1])
+
+    # --- 1. Vol-based lognormal bands (±1σ, ±2σ daily move) ---
+    vol_col = next((c for c in ['Vol_20d', 'Vol_20', 'EWMA'] if c in metrics.columns), None)
+    ann_vol = float(metrics[vol_col].dropna().iloc[-1]) if vol_col else None
+    daily_sigma = ann_vol / (252 ** 0.5) if ann_vol else None
+
+    sigma_bands = {}
+    if daily_sigma:
+        sigma_bands = {
+            'bull_2s': last * np.exp( 2 * daily_sigma),
+            'bull_1s': last * np.exp( 1 * daily_sigma),
+            'bear_1s': last * np.exp(-1 * daily_sigma),
+            'bear_2s': last * np.exp(-2 * daily_sigma),
+        }
+
+    # --- 2. ATR-based support / resistance (14-day) ---
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = float(tr.rolling(14).mean().iloc[-1])
+    atr_bands = {
+        'atr_res': last + 1.5 * atr14,
+        'atr_sup': last - 1.5 * atr14,
+        'atr14':   atr14,
+    }
+
+    # --- 3. Bollinger Bands (20-day, ±2σ price) ---
+    sma20   = float(close.rolling(20).mean().iloc[-1])
+    std20   = float(close.rolling(20).std().iloc[-1])
+    bb_bands = {
+        'bb_upper': sma20 + 2 * std20,
+        'bb_mid':   sma20,
+        'bb_lower': sma20 - 2 * std20,
+    }
+
+    # --- 4. 52-week high / low ---
+    w52 = close.last('252D') if len(close) >= 252 else close
+    week52 = {
+        'high52': float(w52.max()),
+        'low52':  float(w52.min()),
+    }
+
+    return {
+        'last':       last,
+        'daily_sigma': daily_sigma,
+        'ann_vol':    ann_vol,
+        'atr14':      atr14,
+        **sigma_bands,
+        **atr_bands,
+        **bb_bands,
+        **week52,
+    }
+
 # ==============================================================================
 # Main App
 # ==============================================================================
@@ -500,6 +564,113 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                 st.warning("GARCH model could not be fitted. Try a longer data period.")
 
             st.divider()
+
+        # ------------------------------------------------------------------
+        # Statistical Price Targets
+        # ------------------------------------------------------------------
+        st.markdown("### 🎯 Statistical Price Targets")
+        st.caption("Derived from realized volatility, ATR-14, and Bollinger Bands — no fundamental inputs.")
+
+        pt = calculate_price_targets(full_data, metrics)
+        last = pt['last']
+
+        # ---- Metric cards row 1: Vol-based bands ----
+        if pt.get('daily_sigma'):
+            st.markdown("**📊 Volatility Bands** &nbsp; *(±1σ / ±2σ daily lognormal move from last close)*", unsafe_allow_html=True)
+            vc1, vc2, vc3, vc4, vc5 = st.columns(5)
+            with vc1:
+                st.metric("🔴 Bear 2σ",  f"₹{pt['bear_2s']:,.2f}", f"{(pt['bear_2s']/last - 1)*100:+.2f}%")
+            with vc2:
+                st.metric("🟠 Bear 1σ",  f"₹{pt['bear_1s']:,.2f}", f"{(pt['bear_1s']/last - 1)*100:+.2f}%")
+            with vc3:
+                st.metric("⚪ Last Close", f"₹{last:,.2f}")
+            with vc4:
+                st.metric("🟠 Bull 1σ",  f"₹{pt['bull_1s']:,.2f}", f"{(pt['bull_1s']/last - 1)*100:+.2f}%")
+            with vc5:
+                st.metric("🟢 Bull 2σ",  f"₹{pt['bull_2s']:,.2f}", f"{(pt['bull_2s']/last - 1)*100:+.2f}%")
+
+        # ---- Metric cards row 2: ATR & Bollinger ----
+        ac1, ac2, ac3, ac4, ac5 = st.columns(5)
+        with ac1:
+            st.metric("ATR Support",    f"₹{pt['atr_sup']:,.2f}", f"{(pt['atr_sup']/last - 1)*100:+.2f}%")
+        with ac2:
+            st.metric("BB Lower",       f"₹{pt['bb_lower']:,.2f}", f"{(pt['bb_lower']/last - 1)*100:+.2f}%")
+        with ac3:
+            st.metric("BB Mid (SMA20)", f"₹{pt['bb_mid']:,.2f}",   f"{(pt['bb_mid']/last - 1)*100:+.2f}%")
+        with ac4:
+            st.metric("BB Upper",       f"₹{pt['bb_upper']:,.2f}", f"{(pt['bb_upper']/last - 1)*100:+.2f}%")
+        with ac5:
+            st.metric("ATR Resistance", f"₹{pt['atr_res']:,.2f}",  f"{(pt['atr_res']/last - 1)*100:+.2f}%")
+
+        # ---- Horizontal target chart ----
+        levels = []
+        if pt.get('bear_2s'):
+            levels += [
+                ("Bear 2σ",        pt['bear_2s'],    "#DC2626"),
+                ("Bear 1σ",        pt['bear_1s'],    "#F87171"),
+            ]
+        levels += [
+            ("ATR Support",     pt['atr_sup'],    "#B45309"),
+            ("BB Lower",        pt['bb_lower'],   "#6B7280"),
+            ("BB Mid (SMA20)",  pt['bb_mid'],     "#475569"),
+            ("Last Close",      last,             "#111827"),
+            ("BB Upper",        pt['bb_upper'],   "#0891B2"),
+            ("ATR Resistance",  pt['atr_res'],    "#92400E"),
+        ]
+        if pt.get('bull_1s'):
+            levels += [
+                ("Bull 1σ",        pt['bull_1s'],    "#34D399"),
+                ("Bull 2σ",        pt['bull_2s'],    "#059669"),
+            ]
+        levels += [
+            ("52W High",        pt['high52'],     "#4F46E5"),
+            ("52W Low",         pt['low52'],      "#7C3AED"),
+        ]
+
+        # Sort by price for a clean waterfall look
+        levels_sorted = sorted(levels, key=lambda x: x[1])
+        names  = [l[0] for l in levels_sorted]
+        prices = [l[1] for l in levels_sorted]
+        colors = [l[2] for l in levels_sorted]
+        pct    = [(p / last - 1) * 100 for p in prices]
+
+        fig_pt = go.Figure()
+        fig_pt.add_trace(go.Bar(
+            y=names,
+            x=pct,
+            orientation='h',
+            marker=dict(color=colors, line=dict(width=0)),
+            text=[f"₹{p:,.2f}  ({d:+.2f}%)" for p, d in zip(prices, pct)],
+            textposition='outside',
+            textfont=dict(size=11, color='#111827'),
+            hovertemplate='%{y}: ₹%{text}<extra></extra>',
+        ))
+        # Zero line = last close
+        fig_pt.add_vline(x=0, line=dict(color='#111827', width=1.5, dash='dot'))
+        fig_pt.update_layout(
+            height=340,
+            paper_bgcolor=QUANT_COLORS['bg'],
+            plot_bgcolor=QUANT_COLORS['panel'],
+            font=dict(color=QUANT_COLORS['text'], family='IBM Plex Sans', size=11),
+            xaxis=dict(
+                title="% from Last Close",
+                tickformat='.1f',
+                ticksuffix='%',
+                gridcolor=QUANT_COLORS['grid'],
+                zeroline=False,
+            ),
+            yaxis=dict(gridcolor='rgba(0,0,0,0)'),
+            margin=dict(l=120, r=140, t=20, b=40),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_pt, use_container_width=True)
+        st.caption(
+            f"📌 ATR-14: ₹{pt['atr14']:,.2f}  ·  "
+            f"Daily σ: {pt['daily_sigma']*100:.2f}%  ·  "
+            f"Ann. Vol: {pt['ann_vol']*100:.1f}%" if pt.get('daily_sigma') else ""
+        )
+
+        st.divider()
 
         # ------------------------------------------------------------------
         # Main Volatility Chart - Quant Style
