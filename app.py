@@ -361,7 +361,7 @@ def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame) -> dict:
     }
 
     # --- 4. 52-week high / low ---
-    w52 = close.last('252D') if len(close) >= 252 else close
+    w52 = close.iloc[-252:] if len(close) >= 252 else close
     week52 = {
         'high52': float(w52.max()),
         'low52':  float(w52.min()),
