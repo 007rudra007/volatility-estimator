@@ -286,6 +286,34 @@ def load_event_calendar():
         st.warning("⚠️ Event calendar not found. Event analysis disabled.")
         return pd.DataFrame()
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes (near real-time)
+def fetch_intraday_hl(ticker: str) -> dict:
+    """Fetch today's 1-day high/low/open/close from Yahoo Finance."""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="2d", interval="1d")
+        if hist.empty:
+            return None
+        hist = flatten_columns(hist) if isinstance(hist.columns, pd.MultiIndex) else hist
+        today = hist.iloc[-1]
+        prev  = hist.iloc[-2] if len(hist) > 1 else None
+        day_range = float(today['High']) - float(today['Low'])
+        close     = float(today['Close'])
+        position  = ((close - float(today['Low'])) / day_range * 100) if day_range > 0 else 50.0
+        chg       = ((close - float(prev['Close'])) / float(prev['Close']) * 100) if prev is not None else None
+        return {
+            'high':     float(today['High']),
+            'low':      float(today['Low']),
+            'open':     float(today['Open']),
+            'close':    close,
+            'range':    day_range,
+            'position': position,   # 0–100 % from low
+            'chg_pct':  chg,
+            'date':     str(hist.index[-1].date()),
+        }
+    except Exception as e:
+        return None
+
 # ==============================================================================
 # Main App
 # ==============================================================================
@@ -377,6 +405,74 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                 current_regime
             )
         
+        # ------------------------------------------------------------------
+        # 1-Day High / Low Snapshot
+        # ------------------------------------------------------------------
+        st.markdown("### 📅 1-Day High / Low Snapshot")
+
+        hl = fetch_intraday_hl(ticker)
+        if hl:
+            hl_c1, hl_c2, hl_c3, hl_c4, hl_c5 = st.columns(5)
+            chg_str  = f"{hl['chg_pct']:+.2f}%" if hl['chg_pct'] is not None else "N/A"
+            chg_delta = f"{hl['chg_pct']:.2f}" if hl['chg_pct'] is not None else None
+
+            with hl_c1:
+                st.metric("Day High",  f"₹{hl['high']:,.2f}")
+            with hl_c2:
+                st.metric("Day Low",   f"₹{hl['low']:,.2f}")
+            with hl_c3:
+                st.metric("Last Close", f"₹{hl['close']:,.2f}",
+                          delta=chg_str if hl['chg_pct'] is not None else None)
+            with hl_c4:
+                st.metric("Day Range", f"₹{hl['range']:,.2f}")
+            with hl_c5:
+                st.metric("Position in Range", f"{hl['position']:.1f}%",
+                          help="0% = at day low, 100% = at day high")
+
+            # Visual gauge — horizontal bar showing where close sits in the day range
+            pos = hl['position'] / 100  # 0.0 – 1.0
+            gauge_color = (
+                "#059669" if pos >= 0.65 else   # upper third → green
+                "#DC2626" if pos <= 0.35 else   # lower third → red
+                "#D97706"                        # middle       → amber
+            )
+            st.markdown(
+                f"""
+                <div style="margin:6px 0 2px 0; font-size:12px; color:#6B7280;">
+                    Day Range Gauge &nbsp;|&nbsp;
+                    <span style="color:#6B7280;">Low ₹{hl['low']:,.2f}</span>
+                    &nbsp;―&nbsp;
+                    <span style="color:{gauge_color}; font-weight:600;">Close ₹{hl['close']:,.2f}</span>
+                    &nbsp;―&nbsp;
+                    <span style="color:#6B7280;">High ₹{hl['high']:,.2f}</span>
+                    &nbsp;&nbsp;<span style='color:#9CA3AF; font-size:11px;'>({hl['date']})</span>
+                </div>
+                <div style="background:#E5E7EB; border-radius:6px; height:14px; position:relative; overflow:hidden;">
+                    <div style="
+                        width:{hl['position']:.1f}%;
+                        background:{gauge_color};
+                        height:100%;
+                        border-radius:6px;
+                        transition:width 0.4s ease;
+                    "></div>
+                    <div style="
+                        position:absolute;
+                        left:calc({hl['position']:.1f}% - 1px);
+                        top:0; bottom:0;
+                        width:3px;
+                        background:#111827;
+                        border-radius:2px;
+                    "></div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            st.caption(f"🕐 Refreshes every 5 min  |  Data: Yahoo Finance  |  {hl['date']}")
+        else:
+            st.info("⚠️ Could not fetch intraday data for this ticker. Historical analysis continues below.")
+
+        st.divider()
+
         # ------------------------------------------------------------------
         # Main Volatility Chart - Quant Style
         # ------------------------------------------------------------------
