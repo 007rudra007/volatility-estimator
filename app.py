@@ -161,11 +161,12 @@ st.sidebar.image("https://upload.wikimedia.org/wikipedia/en/a/a9/Flag_of_India.s
 st.sidebar.title("🇮🇳 Volatility Analyzer")
 st.sidebar.markdown("---")
 
-# Exchange selection
+# Exchange / Market selection
 exchange = st.sidebar.radio(
     "📈 Select Exchange",
-    ["NSE", "BSE"],
-    horizontal=True
+    ["NSE", "BSE", "Global"],
+    horizontal=True,
+    help="Global: enter any Yahoo Finance ticker (e.g. AAPL, BTC-USD, ^GSPC)"
 )
 
 # Popular tickers by exchange
@@ -181,24 +182,52 @@ POPULAR_BSE = [
     "^BSESN"  # Sensex
 ]
 
-POPULAR_TICKERS = POPULAR_NSE if exchange == "NSE" else POPULAR_BSE
-suffix = ".NS" if exchange == "NSE" else ".BO"
+POPULAR_GLOBAL = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+    "^GSPC", "^DJI", "^VIX",
+    "BTC-USD", "GC=F", "CL=F"  # Bitcoin, Gold, Crude Oil
+]
 
-# Ticker selection
-ticker_option = st.sidebar.selectbox(
-    "📌 Select a Stock",
-    ["Custom"] + POPULAR_TICKERS,
-    index=4  # Default to HDFCBANK
+suffix = ".NS" if exchange == "NSE" else (".BO" if exchange == "BSE" else "")
+
+# --- Custom ticker input (always visible at top) ---
+st.sidebar.markdown("### 🔍 Custom Ticker")
+custom_raw = st.sidebar.text_input(
+    "Enter any ticker symbol",
+    value="",
+    placeholder=f"e.g. {'RELIANCE' if exchange != 'Global' else 'AAPL'}",
+    help="Type any Yahoo Finance symbol. Leave blank to use the popular list below."
 )
 
-if ticker_option == "Custom":
-    ticker = st.sidebar.text_input(
-        f"Enter {exchange} Symbol",
-        f"RELIANCE{suffix}",
-        help=f"Use {suffix} suffix for {exchange} stocks (e.g., RELIANCE{suffix})"
-    )
+# Auto-append suffix for NSE/BSE if user forgot it
+auto_suffix = st.sidebar.checkbox(
+    f"Auto-add {suffix} suffix" if suffix else "Auto-add suffix",
+    value=True,
+    disabled=(exchange == "Global"),
+    help=f"Automatically appends '{suffix}' if not already present. Disable for indices (^NSEI)."
+)
+
+if custom_raw.strip():
+    raw = custom_raw.strip().upper()
+    if exchange != "Global" and auto_suffix and suffix and not raw.endswith(suffix) and not raw.startswith("^"):
+        ticker = raw + suffix
+        st.sidebar.caption(f"ℹ️ Using symbol: `{ticker}`")
+    else:
+        ticker = raw
+        st.sidebar.caption(f"ℹ️ Using symbol: `{ticker}`")
 else:
+    # Fall back to popular tickers dropdown
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**— or pick from popular —**")
+    POPULAR_TICKERS = POPULAR_NSE if exchange == "NSE" else (POPULAR_BSE if exchange == "BSE" else POPULAR_GLOBAL)
+    ticker_option = st.sidebar.selectbox(
+        "📌 Popular Stocks",
+        POPULAR_TICKERS,
+        index=3  # Default to HDFCBANK / NVDA
+    )
     ticker = ticker_option
+
+st.sidebar.markdown("---")
 
 # Date range selection
 st.sidebar.markdown("### 📅 Date Range")
