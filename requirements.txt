@@ -12,6 +12,9 @@ pandas>=2.0.0
 scipy>=1.11.0
 arch>=6.2.0
 
+# Neural Volatility Forecaster (GARCH → LSTM)
+torch>=2.1.0         # CPU build is fine; no CUDA required
+
 # Dashboard & Visualization
 streamlit>=1.30.0
 plotly>=5.18.0

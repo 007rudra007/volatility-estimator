@@ -82,7 +82,34 @@ def calculate_ewma_vol(
     return ewma_vol
 
 
-def calculate_metrics(prices: pd.Series) -> pd.DataFrame:
+def calculate_sma_vol(
+    returns: pd.Series,
+    window: int = 20
+) -> pd.Series:
+    r"""
+    Calculate SMA (Simple Moving Average) volatility (zero-mean assumption).
+    
+    Formula: σ²_t = (1 / N) * \sum_{i=0}^{N-1} r²_{t-i}
+    Annualized: σ_t = sqrt(σ²_t) * sqrt(252)
+    
+    Args:
+        returns: Series of log returns
+        window: SMA rolling window size in days
+        
+    Returns:
+        Series of SMA volatility (annualized)
+    """
+    # Ensure returns is a Series
+    if isinstance(returns, pd.DataFrame):
+        returns = returns.iloc[:, 0] if returns.shape[1] == 1 else returns.squeeze()
+    
+    squared_returns = returns ** 2
+    sma_variance = squared_returns.rolling(window=window).mean()
+    sma_vol = np.sqrt(sma_variance) * np.sqrt(252)
+    return sma_vol
+
+
+def calculate_metrics(prices: pd.Series, sma_window: int = 20) -> pd.DataFrame:
     """
     Calculate all volatility metrics from price series.
     
@@ -90,6 +117,7 @@ def calculate_metrics(prices: pd.Series) -> pd.DataFrame:
     
     Args:
         prices: Series of asset closing prices (or DataFrame with single column)
+        sma_window: Rolling window size for SMA volatility (default 20)
         
     Returns:
         DataFrame with Log Returns and all volatility metrics
@@ -108,10 +136,12 @@ def calculate_metrics(prices: pd.Series) -> pd.DataFrame:
     log_ret = calculate_log_returns(prices)
     rolling_vol = calculate_rolling_vol(log_ret, windows=[20, 60, 120])
     ewma_vol = calculate_ewma_vol(log_ret, span=20)
+    sma_vol = calculate_sma_vol(log_ret, window=sma_window)
     
     result = pd.DataFrame({
         'Log_Ret': log_ret,
-        'EWMA': ewma_vol
+        'EWMA': ewma_vol,
+        f'SMA_{sma_window}d': sma_vol
     }, index=prices.index)
     result = pd.concat([result, rolling_vol], axis=1)
     
@@ -185,6 +215,102 @@ def fit_garch(
         return None
     except Exception as e:
         print(f"GARCH fitting failed: {e}")
+        return None
+
+
+def fit_egarch(
+    returns: pd.Series,
+    p: int = 1,
+    q: int = 1
+) -> Optional[Dict]:
+    """
+    Fit EGARCH(p,q) model to returns and extract parameters including the leverage effect.
+
+    EGARCH(1,1) model (Nelson 1991):
+        log(σ²ₜ) = ω + α·[|εₜ₋₁|/σₜ₋₁ - E|z|] + γ·(εₜ₋₁/σₜ₋₁) + β·log(σ²ₜ₋₁)
+
+    Key difference vs GARCH:
+    - α (alpha): magnitude of shock (symmetric, always positive)
+    - γ (gamma): LEVERAGE EFFECT — direction of shock
+        γ < 0  → bearish shocks amplify volatility MORE than bullish shocks of equal size
+        γ = 0  → symmetric (reduces to GARCH-like behaviour)
+        γ > 0  → bullish shocks dominate (rare)
+    - β (beta): log-variance persistence
+    - Because the model is in log space, σ² stays positive without constraints.
+
+    Args:
+        returns: Series of log returns (dropna applied)
+        p: EGARCH lag order (ARCH component)
+        q: GARCH lag order (persistence component)
+
+    Returns:
+        Dict with fitted parameters or None if fitting fails.
+        Extra keys vs fit_garch():
+          'gamma'            : leverage parameter γ
+          'leverage_dir'     : 'Bearish amplification' / 'Bullish amplification' / 'Symmetric'
+          'leverage_pct'     : how much MORE a −1σ shock raises vol vs a +1σ shock (%)
+    """
+    try:
+        from arch import arch_model
+
+        clean_returns = returns.dropna() * 100   # scale for numerical stability
+
+        model = arch_model(clean_returns, vol='EGARCH', p=p, q=q)
+        result = model.fit(disp='off')
+
+        alpha = result.params.get('alpha[1]', None)
+        gamma = result.params.get('gamma[1]', None)
+        beta  = result.params.get('beta[1]',  None)
+        omega = result.params.get('omega',     None)
+
+        params = {
+            'omega':        omega,
+            'alpha':        alpha,
+            'gamma':        gamma,
+            'beta':         beta,
+            'persistence':  abs(beta) if beta is not None else None,
+            'long_term_vol': None,
+            'forecast_1d':  None,
+            'aic': result.aic,
+            'bic': result.bic,
+            # Leverage interpretation
+            'leverage_dir': None,
+            'leverage_pct': None,
+        }
+
+        # Leverage direction & magnitude
+        if gamma is not None:
+            if gamma < -0.01:
+                params['leverage_dir'] = 'Bearish amplification'
+            elif gamma > 0.01:
+                params['leverage_dir'] = 'Bullish amplification'
+            else:
+                params['leverage_dir'] = 'Symmetric'
+
+            # % vol premium for a negative shock vs positive shock of same size
+            # log(σ²) changes by (α + γ) for z<0 vs (α - γ) for z>0  (using |z|=1)
+            neg_shock_effect = abs(alpha or 0) + gamma
+            pos_shock_effect = abs(alpha or 0) - gamma
+            if pos_shock_effect != 0:
+                params['leverage_pct'] = (neg_shock_effect / pos_shock_effect - 1) * 100
+
+        # 1-day ahead forecast
+        try:
+            forecast = result.forecast(horizon=1)
+            if forecast.variance is not None and len(forecast.variance) > 0:
+                params['forecast_1d'] = (
+                    np.sqrt(forecast.variance.iloc[-1].values[0]) / 100 * np.sqrt(252)
+                )
+        except Exception:
+            pass
+
+        return params
+
+    except ImportError:
+        print("Warning: 'arch' package not installed. EGARCH fitting unavailable.")
+        return None
+    except Exception as e:
+        print(f"EGARCH fitting failed: {e}")
         return None
 
 
@@ -272,3 +398,57 @@ def get_zscore(current_vol: float, stats: Dict) -> float:
     if stats['std_52w'] == 0:
         return 0.0
     return (current_vol - stats['avg_52w']) / stats['std_52w']
+
+
+def calculate_donchian_channels(high: pd.Series, low: pd.Series, window: int = 20) -> pd.DataFrame:
+    """
+    Calculate Donchian Channels (Upper, Lower, Middle bands).
+    
+    Formula:
+    Upper Band = rolling max of High
+    Lower Band = rolling min of Low
+    Middle Band = (Upper + Lower) / 2
+    
+    Args:
+        high: Series of asset high prices
+        low: Series of asset low prices
+        window: Donchian look-back period (default 20)
+        
+    Returns:
+        DataFrame with Donchian_Upper, Donchian_Lower, Donchian_Middle columns
+    """
+    upper = high.rolling(window=window).max()
+    lower = low.rolling(window=window).min()
+    middle = (upper + lower) / 2
+    
+    return pd.DataFrame({
+        'Donchian_Upper': upper,
+        'Donchian_Lower': lower,
+        'Donchian_Middle': middle
+    }, index=high.index)
+
+
+def calculate_volume_metrics(volume: pd.Series, window: int = 20) -> pd.DataFrame:
+    """
+    Calculate trading Volume SMA and Relative Volume (RVOL).
+    
+    Formula:
+    Volume_SMA = rolling mean of Volume
+    RVOL = Volume / Volume_SMA
+    
+    Args:
+        volume: Series of asset volumes
+        window: SMA window size (default 20)
+        
+    Returns:
+        DataFrame with Volume_SMA and RVOL columns
+    """
+    volume_sma = volume.rolling(window=window).mean()
+    # Avoid zero division
+    safe_sma = volume_sma.replace(0, np.nan)
+    rvol = volume / safe_sma
+    
+    return pd.DataFrame({
+        'Volume_SMA': volume_sma,
+        'RVOL': rvol
+    }, index=volume.index)
