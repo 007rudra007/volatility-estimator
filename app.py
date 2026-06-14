@@ -34,6 +34,7 @@ from event_analyzer import (
     get_event_type_stats,
     get_upcoming_events
 )
+import wave_theory
 
 # ==============================================================================
 # Page Configuration
@@ -343,6 +344,57 @@ show_advanced = st.sidebar.checkbox(
     help="Enables Monte Carlo simulations, ARIMA, Hurst memory, and automated Support/Resistance models"
 )
 
+# Wave & Fibonacci Options
+st.sidebar.markdown("### 🌊 Wave & Fibonacci Options")
+show_wave_fib = st.sidebar.checkbox(
+    "Enable Wave & Fibonacci Analysis",
+    value=True,
+    help="Identifies structural Elliott Waves, dynamic price/vol retracements, and volatility bands"
+)
+
+if show_wave_fib:
+    auto_wave_dev = st.sidebar.checkbox(
+        "Auto Wave Sensitivity",
+        value=True,
+        help="Sets swing deviation threshold dynamically based on recent volatility"
+    )
+    if not auto_wave_dev:
+        wave_dev_pct = st.sidebar.slider(
+            "Wave Deviation (%)",
+            0.5, 15.0, 2.5, 0.1,
+            help="Minimum price percentage move to trigger a new swing high/low"
+        )
+    else:
+        wave_dev_pct = 2.0
+    
+    show_wave_lines = st.sidebar.checkbox("Show Wave Lines & Labels", value=True)
+    show_price_fib = st.sidebar.checkbox("Show Price Retracements", value=True)
+    show_vol_fib = st.sidebar.checkbox("Show Volatility Retracements", value=True)
+    show_fib_bands = st.sidebar.checkbox("Show Volatility Bands", value=True)
+else:
+    auto_wave_dev = True
+    wave_dev_pct = 2.0
+    show_wave_lines = False
+    show_price_fib = False
+    show_vol_fib = False
+    show_fib_bands = False
+
+# Predictive AI Options
+st.sidebar.markdown("### 🧠 Predictive AI Options")
+show_predictor = st.sidebar.checkbox(
+    "Enable Price & Trend AI Predictor",
+    value=False,
+    help="Trains a PyTorch Deep Neural Network and Random Forest to forecast daily range and weekly trend"
+)
+if show_predictor:
+    predict_epochs = st.sidebar.slider(
+        "Training Epochs (AI)",
+        10, 100, 40, 5,
+        help="Number of training iterations for the Neural Network. Higher values improve fit but increase training time."
+    )
+else:
+    predict_epochs = 40
+
 # New SMA Volatility & Donchian / Volume Options
 st.sidebar.markdown("### 📊 SMA & Donchian Options")
 sma_window = st.sidebar.slider(
@@ -639,6 +691,12 @@ if analyze_clicked or 'data_loaded' in st.session_state:
             events_in_range = filter_events_in_range(events_df, start_date, end_date)
         else:
             events_in_range = pd.DataFrame()
+            
+        # Core derivations (COT, CVD) used by both AI predictors and confirmations tab
+        import confirmations_engine as ce
+        cot_df = ce.get_cot_positioning(ticker, data['Close'])
+        daily_cvd = ce.calculate_daily_cvd(data)
+        daily_div_signals = ce.detect_cvd_divergences(data['Close'], daily_cvd, window=cvd_window)
         
         # ------------------------------------------------------------------
         # Key Metrics Row
@@ -688,6 +746,64 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         st.markdown("### 📅 1-Day High / Low Snapshot")
 
         hl = fetch_intraday_hl(ticker)
+        
+        # Wave Theory & Fibonacci Calculations
+        if show_wave_fib:
+            # 1. Dynamic or manual deviation
+            if auto_wave_dev:
+                deviation_pct = wave_theory.get_dynamic_deviation(data, metrics)
+            else:
+                deviation_pct = wave_dev_pct
+                
+            # 2. Run ZigZag
+            pivot_df = wave_theory.calculate_zigzag(data, deviation_pct=deviation_pct)
+            
+            # 3. Label Waves
+            pivot_df = wave_theory.label_elliott_waves(pivot_df)
+            
+            # 4. Get active swing Fibonacci retracements
+            current_p = hl['close'] if hl else float(data['Close'].iloc[-1])
+            fib_levels, swing_dates = wave_theory.calculate_active_swing_fibs(pivot_df, current_p)
+            
+            # 5. Get volatility Fibonacci levels
+            vol_fibs = wave_theory.calculate_fib_vol_retracement(metrics[vol_col])
+            
+            # 6. Get Fibonacci Volatility Bands
+            fib_bands = wave_theory.calculate_fib_vol_bands(data['Close'], metrics[vol_col], window=20)
+            
+        # AI Predictive Synthesis Calculations
+        if show_predictor:
+            import predictive_engine
+            
+            # Setup indicators
+            pred_engine = predictive_engine.SynthesisPredictiveEngine(
+                data=data,
+                metrics=metrics,
+                cot_df=cot_df,
+                daily_cvd=daily_cvd,
+                daily_div_signals=daily_div_signals,
+                pivot_df=pivot_df if (show_wave_fib and 'pivot_df' in locals()) else None
+            )
+            
+            # Show progress bar in Streamlit
+            progress_bar = st.progress(0, text="Initializing Synthesis AI Models...")
+            def _pred_progress(epoch, total, loss):
+                pct = int(epoch / total * 100)
+                progress_bar.progress(pct, text=f"Training Predictive NN - epoch {epoch}/{total} | loss {loss:.5f}")
+                
+            with st.spinner("Training ML baseline & Deep Learning Neural Network..."):
+                try:
+                    pred_engine.train(epochs=predict_epochs, progress_callback=_pred_progress)
+                    progress_bar.progress(100, text="✅ AI Model Training Complete")
+                    predictions_dict = pred_engine.predict_latest()
+                    st.session_state['_predictions_dict_cache'] = predictions_dict
+                except Exception as e:
+                    st.error(f"Predictive Engine training failed: {e}")
+                    st.session_state['_predictions_dict_cache'] = None
+            progress_bar.empty()
+        else:
+            st.session_state['_predictions_dict_cache'] = None
+            
         if hl:
             hl_c1, hl_c2, hl_c3, hl_c4, hl_c5 = st.columns(5)
             chg_str  = f"{hl['chg_pct']:+.2f}%" if hl['chg_pct'] is not None else "N/A"
@@ -763,6 +879,152 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         tab_conf = st.container()
 
         with tab_vol:
+            # 🌊 Wave & Fibonacci Projections Summary Card
+            if show_wave_fib:
+                st.markdown("### 🌊 Elliott Wave & Fibonacci Projections")
+                st.caption("Identifies structural price swings and calculates dynamic volatility-based retracements.")
+                
+                wcol1, wcol2, wcol3 = st.columns(3)
+                
+                with wcol1:
+                    status_str = pivot_df['Rule_Status'].iloc[-1] if not pivot_df.empty else "No pivots detected"
+                    st.metric(
+                        label="Elliott Wave Structure",
+                        value="Active" if "Impulse" in status_str else "Searching...",
+                        help="Checks rules: Wave 2 retracement, Wave 3 shortest, Wave 4 overlap, Wave 5 truncation."
+                    )
+                    st.caption(f"**Status:** {status_str}")
+                    
+                with wcol2:
+                    if vol_fibs:
+                        st.metric(
+                            label="Volatility Fib Zone",
+                            value=vol_fibs['nearest_level'],
+                            help="Identifies which Fibonacci retracement level the current volatility is closest to."
+                        )
+                        st.caption(f"**Current Vol:** {vol_fibs['current_vol']:.1%} (Range: {vol_fibs['trough']:.1%} - {vol_fibs['peak']:.1%})")
+                    else:
+                        st.metric(label="Volatility Fib Zone", value="N/A")
+                        
+                with wcol3:
+                    if fib_levels and swing_dates:
+                        start_date_str = swing_dates[0].strftime('%d-%b-%y')
+                        end_date_str = swing_dates[1].strftime('%d-%b-%y')
+                        low_key = '100.0% (Low)' if '100.0% (Low)' in fib_levels else '0.0% (Low)'
+                        high_key = '0.0% (High)' if '0.0% (High)' in fib_levels else '100.0% (High)'
+                        st.metric(
+                            label="Active Swing Range",
+                            value=f"₹{fib_levels[low_key]:,.2f} - ₹{fib_levels[high_key]:,.2f}",
+                            help="Price range of the most recent confirmed swing."
+                        )
+                        st.caption(f"**Period:** {start_date_str} to {end_date_str}")
+                    else:
+                        st.metric(label="Active Swing Range", value="N/A")
+                        
+                if fib_levels:
+                    st.markdown("#### 🎯 Active Swing Fibonacci Retracements")
+                    fib_rows = []
+                    for name, val in fib_levels.items():
+                        dist = ((current_p / val) - 1.0) * 100
+                        fib_rows.append({
+                            'Fibonacci Level': name,
+                            'Price (₹)': f"₹{val:,.2f}",
+                            'Distance to Current': f"{dist:+.2f}%",
+                            'Status': "Support" if dist > 0 else "Resistance"
+                        })
+                    st.dataframe(pd.DataFrame(fib_rows).set_index('Fibonacci Level'), use_container_width=True)
+                    
+                st.divider()
+
+            # 🧠 AI Predictive Projections
+            if show_predictor and st.session_state.get('_predictions_dict_cache') is not None:
+                pred_res = st.session_state.get('_predictions_dict_cache')
+                consensus = pred_res['consensus']
+                ml_model = pred_res['ml_model']
+                nn_model = pred_res['nn_model']
+                
+                st.markdown("### 🧠 Machine Learning & Deep Learning Projections")
+                st.caption("Consensus forecasts synthesized from PyTorch Multi-Task ResNet MLP and Multi-Output Random Forest baseline.")
+                
+                pcol1, pcol2, pcol3 = st.columns(3)
+                
+                with pcol1:
+                    st.metric(
+                        label="Next-Day Intraday Target",
+                        value=f"₹{consensus['nd_low']:,.2f} - ₹{consensus['nd_high']:,.2f}",
+                        help="Predicted high and low price levels for the next trading session."
+                    )
+                    st.caption(f"**Expected range:** ₹{(consensus['nd_high'] - consensus['nd_low']):,.2f} ({((consensus['nd_high']/consensus['nd_low']) - 1.0)*100:.2f}%)")
+                    
+                with pcol2:
+                    st.metric(
+                        label="Weekly Expected Range",
+                        value=f"₹{consensus['weekly_low']:,.2f} - ₹{consensus['weekly_high']:,.2f}",
+                        help="Predicted high and low price levels for the next 5 trading sessions."
+                    )
+                    st.caption(f"**Weekly Spread:** ₹{(consensus['weekly_high'] - consensus['weekly_low']):,.2f} ({((consensus['weekly_high']/consensus['weekly_low']) - 1.0)*100:.2f}%)")
+                    
+                with pcol3:
+                    trend_lbl = consensus['trend']
+                    st.metric(
+                        label="Weekly Trend Verdict",
+                        value=trend_lbl,
+                        help="Consensus direction forecast for the next 5 trading sessions."
+                    )
+                    st.caption(
+                        f"**Probabilities:** "
+                        f"Bull {consensus['prob_bull']*100:.0f}% &middot; "
+                        f"Neut {consensus['prob_neut']*100:.0f}% &middot; "
+                        f"Bear {consensus['prob_bear']*100:.0f}%",
+                        unsafe_allow_html=True
+                    )
+                    
+                st.markdown("#### Model Synthesis Consensus Matrix")
+                comp_rows = [
+                    {
+                        'Model': 'PyTorch Deep MLP',
+                        'Next-Day Low': f"₹{nn_model['nd_low']:,.2f}",
+                        'Next-Day High': f"₹{nn_model['nd_high']:,.2f}",
+                        'Weekly Low': f"₹{nn_model['weekly_low']:,.2f}",
+                        'Weekly High': f"₹{nn_model['weekly_high']:,.2f}",
+                        'Weekly Trend': nn_model['trend']
+                    },
+                    {
+                        'Model': 'Random Forest ML',
+                        'Next-Day Low': f"₹{ml_model['nd_low']:,.2f}",
+                        'Next-Day High': f"₹{ml_model['nd_high']:,.2f}",
+                        'Weekly Low': f"₹{ml_model['weekly_low']:,.2f}",
+                        'Weekly High': f"₹{ml_model['weekly_high']:,.2f}",
+                        'Weekly Trend': ml_model['trend']
+                    },
+                    {
+                        'Model': 'Consensus Synthesis',
+                        'Next-Day Low': f"₹{consensus['nd_low']:,.2f}",
+                        'Next-Day High': f"₹{consensus['nd_high']:,.2f}",
+                        'Weekly Low': f"₹{consensus['weekly_low']:,.2f}",
+                        'Weekly High': f"₹{consensus['weekly_high']:,.2f}",
+                        'Weekly Trend': consensus['trend']
+                    }
+                ]
+                st.dataframe(pd.DataFrame(comp_rows).set_index('Model'), use_container_width=True)
+                
+                st.markdown(
+                    f"""
+                    <div style="border-left: 4px solid #1E40AF; padding: 10px 16px; background: #F9FAFB; border-radius: 0 8px 8px 0; margin-bottom: 12px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #1E40AF; text-transform: uppercase;">Validation Metrics (Out-of-Sample)</span>
+                        <br>
+                        <span style="font-size: 12px; color: #6B7280;">
+                            Weekly Trend Direction Accuracy: <strong>{pred_res['val_accuracy']:.1%}</strong>
+                            &nbsp;&middot;&nbsp;
+                            Price Regression Mean Squared Error (MSE): <strong>{pred_res['val_mse']:.6f}</strong>
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                
+                st.divider()
+
             # GARCH(1,1) Forecast  (shown above charts for forward-looking context)
             # ------------------------------------------------------------------
             if show_garch:
@@ -1186,6 +1448,181 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                             x=event_date,
                             line=dict(color=evt_color, width=0.8, dash='dash'),
                             row='all'
+                        )
+        
+            # Wave Theory & Fibonacci Overlays on charts
+            if show_wave_fib:
+                # 1. Volatility Bands FVB (under price line)
+                if show_fib_bands and 'fib_bands' in locals() and not fib_bands.empty:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Middle_Band'],
+                            name="FVB Mid (SMA20)",
+                            line=dict(color="rgba(124, 58, 237, 0.7)", width=1.0),
+                            showlegend=True,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Band 1.618
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Upper_Band_1.618'],
+                            name="FVB 1.618",
+                            line=dict(color="rgba(124, 58, 237, 0.4)", width=0.8),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Lower_Band_1.618'],
+                            name="FVB 1.618",
+                            fill="tonexty",
+                            fillcolor="rgba(124, 58, 237, 0.04)",
+                            line=dict(color="rgba(124, 58, 237, 0.4)", width=0.8),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Band 2.618
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Upper_Band_2.618'],
+                            name="FVB 2.618",
+                            line=dict(color="rgba(124, 58, 237, 0.25)", width=0.8, dash="dash"),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Lower_Band_2.618'],
+                            name="FVB 2.618",
+                            line=dict(color="rgba(124, 58, 237, 0.25)", width=0.8, dash="dash"),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Band 4.236
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Upper_Band_4.236'],
+                            name="FVB 4.236",
+                            line=dict(color="rgba(124, 58, 237, 0.15)", width=0.8, dash="dot"),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fib_bands.index,
+                            y=fib_bands['Lower_Band_4.236'],
+                            name="FVB 4.236",
+                            line=dict(color="rgba(124, 58, 237, 0.15)", width=0.8, dash="dot"),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ),
+                        row=1, col=1
+                    )
+
+                # 2. ZigZag lines & wave label annotations
+                if show_wave_lines and 'pivot_df' in locals() and not pivot_df.empty:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=pivot_df.index,
+                            y=pivot_df['price'],
+                            name="ZigZag Wave Path",
+                            line=dict(color="#10B981", width=1.5, dash="dash"),
+                            mode="lines+markers",
+                            marker=dict(size=6, symbol="diamond", color="#10B981"),
+                            hovertemplate='Wave Pivot: ₹%{y:.2f}<extra></extra>'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    labeled_pivots = pivot_df[pivot_df['Wave_Label'] != ""]
+                    for ts, r_val in labeled_pivots.iterrows():
+                        fig.add_annotation(
+                            x=ts,
+                            y=r_val['price'],
+                            text=f"<b>{r_val['Wave_Label']}</b>",
+                            showarrow=True,
+                            arrowhead=1,
+                            ax=0,
+                            ay=-25 if r_val['type'] == 'Peak' else 25,
+                            arrowcolor="#B45309",
+                            font=dict(color="#FFFFFF", size=10),
+                            bgcolor="#D97706",
+                            bordercolor="#B45309",
+                            borderwidth=1,
+                            borderpad=3,
+                            row=1, col=1
+                        )
+
+                # 3. Price Fibonacci Retracements
+                if show_price_fib and 'fib_levels' in locals() and fib_levels:
+                    for lvl_name, lvl_val in fib_levels.items():
+                        fig.add_trace(
+                            go.Scatter(
+                                x=[swing_dates[0], full_data.index[-1]],
+                                y=[lvl_val, lvl_val],
+                                name=f"Fib {lvl_name}",
+                                line=dict(color="#B45309", width=1.0, dash="dot"),
+                                showlegend=False,
+                                hovertemplate=f"Fib {lvl_name}: ₹{lvl_val:,.2f}<extra></extra>"
+                            ),
+                            row=1, col=1
+                        )
+                        # Add text annotation at the right edge
+                        fig.add_annotation(
+                            x=full_data.index[-1],
+                            y=lvl_val,
+                            text=f" {lvl_name}",
+                            showarrow=False,
+                            xanchor="left",
+                            yanchor="middle",
+                            font=dict(size=8, color="#B45309"),
+                            row=1, col=1
+                        )
+
+                # 4. Volatility Fibonacci Retracements
+                if show_vol_fib and 'vol_fibs' in locals() and vol_fibs:
+                    for lvl_name, lvl_val in vol_fibs['levels'].items():
+                        fig.add_trace(
+                            go.Scatter(
+                                x=[metrics.index[0], metrics.index[-1]],
+                                y=[lvl_val, lvl_val],
+                                name=f"Vol Fib {lvl_name}",
+                                line=dict(color="rgba(180, 83, 9, 0.4)", width=0.8, dash="dot"),
+                                showlegend=False,
+                                hovertemplate=f"Vol Fib {lvl_name}: {lvl_val:.1%}<extra></extra>"
+                            ),
+                            row=2, col=1
+                        )
+                        fig.add_annotation(
+                            x=metrics.index[-1],
+                            y=lvl_val,
+                            text=f" {lvl_name}",
+                            showarrow=False,
+                            xanchor="left",
+                            yanchor="middle",
+                            font=dict(size=8, color="#B45309"),
+                            row=2, col=1
                         )
         
             # Update layout - Institutional quant style
@@ -1735,13 +2172,8 @@ if analyze_clicked or 'data_loaded' in st.session_state:
 
             gex_levels = ce.extract_gex_key_levels(gex_df, spot_price)
 
-            # Calculate COT Positioning (Futures sentiment)
-            cot_df = ce.get_cot_positioning(ticker, data['Close'])
+            # Calculate COT Positioning (Futures sentiment) (using pre-calculated cot_df)
             current_cot_idx = float(cot_df['COT_Index'].iloc[-1])
-
-            # Calculate Daily CVD
-            daily_cvd = ce.calculate_daily_cvd(data)
-            daily_div_signals = ce.detect_cvd_divergences(data['Close'], daily_cvd, window=cvd_window)
             
             # Fetch Intraday CVD
             with st.spinner("Downloading intraday order flow..."):
