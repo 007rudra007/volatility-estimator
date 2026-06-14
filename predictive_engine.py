@@ -269,6 +269,7 @@ def extract_synthesis_features(
 
     # H. VOLATILITY & RISK PROFILE (Tensor 1)
     ewma_vol = metrics['EWMA'].iloc[:, 0] if isinstance(metrics['EWMA'], pd.DataFrame) else metrics['EWMA']
+    ewma_vol = ewma_vol.ffill().bfill().fillna(0.20)
     
     # Simple estimate of daily vol based on EWMA
     daily_vol = (ewma_vol / np.sqrt(252)).ffill().bfill().fillna(0.02)
@@ -282,7 +283,7 @@ def extract_synthesis_features(
         vol_20d = metrics['Vol_20d'].iloc[:, 0] if isinstance(metrics['Vol_20d'], pd.DataFrame) else metrics['Vol_20d']
         features['lstm_garch_delta'] = ((vol_20d - ewma_vol) / ewma_vol.replace(0, 1e-4)).fillna(0.0)
 
-    features['vol_percentile'] = ewma_vol.rolling(252).rank(pct=True).fillna(0.5)
+    features['vol_percentile'] = ewma_vol.rolling(252, min_periods=1).rank(pct=True).fillna(0.5)
     
     # CVaR Tail Risk ratio helper
     features['cvar_ratio'] = compute_rolling_cvar(log_ret, window=20, alpha=0.05)
@@ -297,9 +298,11 @@ def extract_synthesis_features(
     net_gex_pins = []
     gamma_flips = []
     import confirmations_engine as ce
+    close_clean = close.ffill().bfill().fillna(100.0)
+    ewma_vol_clean = ewma_vol.ffill().bfill().fillna(0.20)
     for t_idx in idx:
-        spot = float(close.loc[t_idx])
-        vol = float(ewma_vol.loc[t_idx])
+        spot = float(close_clean.loc[t_idx])
+        vol = float(ewma_vol_clean.loc[t_idx])
         # Generate synthetic GEX profile
         gex_profile = ce.get_synthetic_gex_profile(spot, vol)
         levels = ce.extract_gex_key_levels(gex_profile, spot)

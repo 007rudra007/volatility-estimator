@@ -282,19 +282,28 @@ def extract_gex_key_levels(gex_df: pd.DataFrame, spot_price: float) -> dict:
     if gex_df is None or gex_df.empty:
         return {}
         
-    total_net_gex = float(gex_df['Net_GEX'].sum())
-    total_net_vex = float(gex_df['Net_VEX'].sum()) if 'Net_VEX' in gex_df.columns else 0.0
+    total_net_gex = float(gex_df['Net_GEX'].sum()) if gex_df['Net_GEX'].notna().any() else 0.0
+    total_net_vex = float(gex_df['Net_VEX'].sum()) if ('Net_VEX' in gex_df.columns and gex_df['Net_VEX'].notna().any()) else 0.0
     
     # Peak Call & Put strikes
-    idx_max_call = gex_df['Call_GEX'].idxmax()
-    peak_call_strike = float(gex_df.loc[idx_max_call, 'Strike'])
-    
-    idx_max_put = gex_df['Put_GEX'].idxmin()  # Put GEX is negative
-    peak_put_strike = float(gex_df.loc[idx_max_put, 'Strike'])
-    
+    try:
+        idx_max_call = gex_df['Call_GEX'].idxmax()
+        peak_call_strike = float(gex_df.loc[idx_max_call, 'Strike'])
+    except Exception:
+        peak_call_strike = spot_price
+        
+    try:
+        idx_max_put = gex_df['Put_GEX'].idxmin()  # Put GEX is negative
+        peak_put_strike = float(gex_df.loc[idx_max_put, 'Strike'])
+    except Exception:
+        peak_put_strike = spot_price
+        
     # Peak Net GEX magnitude (Option Pin)
-    idx_max_net = gex_df['Net_GEX'].abs().idxmax()
-    peak_net_strike = float(gex_df.loc[idx_max_net, 'Strike'])
+    try:
+        idx_max_net = gex_df['Net_GEX'].abs().idxmax()
+        peak_net_strike = float(gex_df.loc[idx_max_net, 'Strike'])
+    except Exception:
+        peak_net_strike = spot_price
     
     # Locate Gamma Flip zone where Net GEX crosses 0
     df_sorted = gex_df.sort_values('Strike').reset_index(drop=True)
@@ -518,6 +527,8 @@ def detect_cvd_divergences(prices: pd.Series, cvd_series: pd.Series, window: int
     Returns:
         Series of signals: +1 (Bullish), -1 (Bearish), 0 (No signal)
     """
+    prices = prices.ffill().bfill().fillna(0.0)
+    cvd_series = cvd_series.ffill().bfill().fillna(0.0)
     signals = pd.Series(0, index=prices.index)
     if len(prices) < window + 5:
         return signals
