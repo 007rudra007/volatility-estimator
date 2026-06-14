@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, List, Optional
 import warnings
+import sqlite3
+import os
 
 warnings.filterwarnings("ignore")
 
@@ -31,6 +33,268 @@ except ImportError:
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.metrics import mean_squared_error, accuracy_score
+
+# ==============================================================================
+# SQLite ML prediction ledger & online retraining helpers
+# ==============================================================================
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml_ledger.db')
+
+def init_ledger_db():
+    """Initializes SQLite database and prediction_ledger table if they do not exist."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prediction_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT,
+            prediction_date TEXT,
+            target_date TEXT,
+            close_price REAL,
+            daily_vol REAL,
+            pred_nd_high REAL,
+            pred_nd_low REAL,
+            pred_w_high REAL,
+            pred_w_low REAL,
+            pred_trend INTEGER,
+            actual_nd_high REAL,
+            actual_nd_low REAL,
+            actual_w_high REAL,
+            actual_w_low REAL,
+            actual_trend INTEGER,
+            UNIQUE(ticker, target_date)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def log_prediction(ticker: str, prediction_date: str, target_date: str, close_price: float, daily_vol: float, pred_dict: dict):
+    """Logs a single consensus prediction to the SQLite ledger."""
+    init_ledger_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO prediction_ledger (
+            ticker, prediction_date, target_date, close_price, daily_vol,
+            pred_nd_high, pred_nd_low, pred_w_high, pred_w_low, pred_trend
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        ticker, prediction_date, target_date, float(close_price), float(daily_vol),
+        float(pred_dict['nd_high']), float(pred_dict['nd_low']),
+        float(pred_dict['weekly_high']), float(pred_dict['weekly_low']),
+        int(0 if pred_dict['trend'] == 'Bearish Breakdown' else 2 if pred_dict['trend'] == 'Bullish Breakout' else 1)
+    ))
+    conn.commit()
+    conn.close()
+
+def update_ledger_actuals(ticker: str, data: pd.DataFrame):
+    """
+    Scans the ledger for missing actuals and updates them using new historical EOD data.
+    """
+    init_ledger_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, target_date, close_price FROM prediction_ledger
+        WHERE ticker = ? AND actual_nd_high IS NULL
+    """, (ticker,))
+    rows = cursor.fetchall()
+    
+    if not rows:
+        conn.close()
+        return
+        
+    close = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
+    high = data['High'].iloc[:, 0] if isinstance(data['High'], pd.DataFrame) else data['High']
+    low = data['Low'].iloc[:, 0] if isinstance(data['Low'], pd.DataFrame) else data['Low']
+    
+    for row_id, target_date_str, close_price in rows:
+        try:
+            target_date = pd.Timestamp(target_date_str)
+            matching_dates = high.index[high.index >= target_date]
+            if len(matching_dates) > 0:
+                actual_trading_date = matching_dates[0]
+                if (actual_trading_date - target_date).days <= 4:
+                    actual_nd_high = float(high.loc[actual_trading_date])
+                    actual_nd_low = float(low.loc[actual_trading_date])
+                    
+                    target_idx = close.index.get_loc(actual_trading_date)
+                    if target_idx + 4 < len(close):
+                        w_highs = high.iloc[target_idx : target_idx + 5]
+                        w_lows = low.iloc[target_idx : target_idx + 5]
+                        actual_w_high = float(w_highs.max())
+                        actual_w_low = float(w_lows.min())
+                        
+                        w_return = (float(close.iloc[target_idx + 4]) / close_price) - 1.0
+                        if w_return >= 0.015:
+                            actual_trend = 2
+                        elif w_return <= -0.015:
+                            actual_trend = 0
+                        else:
+                            actual_trend = 1
+                            
+                        cursor.execute("""
+                            UPDATE prediction_ledger
+                            SET actual_nd_high = ?, actual_nd_low = ?,
+                                actual_w_high = ?, actual_w_low = ?,
+                                actual_trend = ?
+                            WHERE id = ?
+                        """, (actual_nd_high, actual_nd_low, actual_w_high, actual_w_low, actual_trend, row_id))
+        except Exception:
+            pass
+            
+    conn.commit()
+    conn.close()
+
+def check_concept_drift(ticker: str, threshold: float = 0.015) -> Tuple[bool, float, Optional[List[dict]]]:
+    """
+    Computes Mean Squared Relative Error of the last 5 completed predictions.
+    Returns (is_drifted, current_rmse, completed_rows_list).
+    """
+    init_ledger_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM prediction_ledger
+        WHERE ticker = ? AND actual_nd_high IS NOT NULL
+        ORDER BY target_date DESC
+        LIMIT 5
+    """, (ticker,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if len(rows) < 5:
+        return False, 0.0, None
+        
+    errors = []
+    for r in rows:
+        act_h = r['actual_nd_high']
+        act_l = r['actual_nd_low']
+        pred_h = r['pred_nd_high']
+        pred_l = r['pred_nd_low']
+        err_h = ((act_h - pred_h) / act_h) ** 2
+        err_l = ((act_l - pred_l) / act_l) ** 2
+        errors.extend([err_h, err_l])
+        
+    mse = float(np.mean(errors))
+    rmse = np.sqrt(mse)
+    return bool(rmse > threshold), rmse, [dict(r) for r in rows]
+
+def get_next_trading_day(date_val):
+    """Helper to return the next calendar day, skipping weekends."""
+    next_day = date_val + pd.Timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += pd.Timedelta(days=1)
+    return next_day
+
+def retrain_online_pytorch(
+    model: nn.Module,
+    ticker: str,
+    scaler: StandardScaler,
+    aligned_features_df: pd.DataFrame,
+    aligned_reg_targets_df: pd.DataFrame,
+    aligned_class_targets_df: pd.DataFrame,
+    hmm: "RegimeSwitchHMM",
+    epochs: int = 8
+):
+    """
+    PyTorch online learning:
+    - Freezes model shared layers.
+    - Unfreezes classification and regression heads.
+    - Trains on the last 10 days of drifted data.
+    """
+    if not TORCH_AVAILABLE or model is None:
+        return
+    if len(aligned_features_df) < 10:
+        return
+        
+    X_drift = aligned_features_df.iloc[-10:].values
+    y_reg_drift = aligned_reg_targets_df.iloc[-10:].values
+    y_class_drift = aligned_class_targets_df.iloc[-10:].values.astype(np.int64)
+    
+    # Extend features with HMM state probabilities
+    hmm_feats = X_drift[:, [2, 3]]
+    hmm_probs = hmm.predict_state_probs(hmm_feats)
+    X_drift_extended = np.hstack([X_drift, hmm_probs])
+    
+    X_drift_scaled = scaler.transform(X_drift_extended).astype(np.float32)
+    X_tensor = torch.tensor(X_drift_scaled)
+    y_reg_tensor = torch.tensor(y_reg_drift, dtype=torch.float32)
+    y_class_tensor = torch.tensor(y_class_drift, dtype=torch.long)
+    
+    for param in model.shared.parameters():
+        param.requires_grad = False
+    for param in model.reg_head.parameters():
+        param.requires_grad = True
+    for param in model.class_head.parameters():
+        param.requires_grad = True
+        
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        return
+        
+    optimizer = torch.optim.Adam(trainable_params, lr=5e-4)
+    class_loss_fn = nn.CrossEntropyLoss()
+    
+    model.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        pred_reg, pred_class = model(X_tensor)
+        
+        l_nd_high = pinball_loss(pred_reg[:, 0], y_reg_tensor[:, 0], 0.90)
+        l_nd_low = pinball_loss(pred_reg[:, 1], y_reg_tensor[:, 1], 0.10)
+        l_w_high = pinball_loss(pred_reg[:, 2], y_reg_tensor[:, 2], 0.90)
+        l_w_low = pinball_loss(pred_reg[:, 3], y_reg_tensor[:, 3], 0.10)
+        
+        l_reg = l_nd_high + l_nd_low + l_w_high + l_w_low
+        l_class = class_loss_fn(pred_class, y_class_tensor)
+        
+        loss = l_reg + 0.2 * l_class
+        loss.backward()
+        optimizer.step()
+        
+    # Re-enable requires_grad for subsequent full retrainings
+    for param in model.shared.parameters():
+        param.requires_grad = True
+
+def retrain_online_rf(
+    rf_reg: RandomForestRegressor,
+    rf_clf: RandomForestClassifier,
+    scaler: StandardScaler,
+    aligned_features_df: pd.DataFrame,
+    aligned_reg_targets_df: pd.DataFrame,
+    aligned_class_targets_df: pd.DataFrame,
+    hmm: "RegimeSwitchHMM"
+):
+    """
+    Random Forest pseudo-online learning:
+    - Sets warm_start=True.
+    - Increases estimators size by 10.
+    - Retrains exclusively on the last 30 days of data.
+    """
+    if len(aligned_features_df) < 30:
+        return
+        
+    X_drift = aligned_features_df.iloc[-30:].values
+    y_reg_drift = aligned_reg_targets_df.iloc[-30:].values
+    y_class_drift = aligned_class_targets_df.iloc[-30:].values.astype(np.int64)
+    
+    # Extend features with HMM state probabilities
+    hmm_feats = X_drift[:, [2, 3]]
+    hmm_probs = hmm.predict_state_probs(hmm_feats)
+    X_drift_extended = np.hstack([X_drift, hmm_probs])
+    
+    X_drift_scaled = scaler.transform(X_drift_extended)
+    
+    rf_reg.warm_start = True
+    rf_clf.warm_start = True
+    
+    rf_reg.n_estimators += 10
+    rf_clf.n_estimators += 10
+    
+    rf_reg.fit(X_drift_scaled, y_reg_drift)
+    rf_clf.fit(X_drift_scaled, y_class_drift)
 
 # Streamlit caching support
 try:
@@ -502,7 +766,8 @@ class SynthesisPredictiveEngine:
         daily_div_signals: pd.Series,
         pivot_df: pd.DataFrame,
         lstm_series: pd.Series = None,
-        event_df: pd.DataFrame = None
+        event_df: pd.DataFrame = None,
+        ticker: str = "UNKNOWN"
     ):
         self.data = data
         self.metrics = metrics
@@ -512,13 +777,19 @@ class SynthesisPredictiveEngine:
         self.pivot_df = pivot_df
         self.lstm_series = lstm_series
         self.event_df = event_df
+        self.ticker = ticker
         
         self.scaler = StandardScaler()
-        self.rf_reg = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.rf_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.rf_reg = RandomForestRegressor(n_estimators=100, random_state=42, warm_start=True)
+        self.rf_clf = RandomForestClassifier(n_estimators=100, random_state=42, warm_start=True)
         
         self.nn_model = None
         self.is_trained = False
+        
+        # Aligned historical data placeholders
+        self.aligned_features_df = None
+        self.aligned_reg_targets_df = None
+        self.aligned_class_targets_df = None
         
         # Meta stats
         self.features_count = 0
@@ -570,6 +841,10 @@ class SynthesisPredictiveEngine:
         self.aligned_index = merged.index
         
         feat_cols = X_df.columns
+        self.aligned_features_df = merged[feat_cols]
+        self.aligned_reg_targets_df = merged[['nd_high', 'nd_low', 'w_high', 'w_low']]
+        self.aligned_class_targets_df = merged['weekly_trend']
+        
         X = merged[feat_cols].values
         y_reg = merged[['nd_high', 'nd_low', 'w_high', 'w_low']].values
         y_class = merged['weekly_trend'].values.astype(np.int64)
@@ -705,10 +980,54 @@ class SynthesisPredictiveEngine:
         intraday range and weekly trend. Scales the predicted Z-Scores back 
         to price levels using the latest GARCH daily volatility.
         Calibrates outputs using Conformal Prediction (CQR) and predicts HMM regime state.
+        Monitors concept drift and performs online updates of models when necessary.
         """
         if not self.is_trained:
             raise RuntimeError("Engine must be trained before predicting.")
             
+        # --- ML Exclusive Online Retrain Loop (Concept Drift) ---
+        # 1. Update ledger actuals using latest historical data
+        try:
+            update_ledger_actuals(self.ticker, self.data)
+        except Exception:
+            pass
+            
+        # 2. Check for concept drift (rolling 5-day error threshold of 1.5%)
+        is_drifted = False
+        rmse = 0.0
+        try:
+            is_drifted, rmse, recent_rows = check_concept_drift(self.ticker, threshold=0.015)
+        except Exception:
+            pass
+            
+        # 3. If drift is triggered, run model-specific online updates
+        drift_event_fired = False
+        if is_drifted:
+            drift_event_fired = True
+            try:
+                if TORCH_AVAILABLE and self.nn_model is not None:
+                    retrain_online_pytorch(
+                        model=self.nn_model,
+                        ticker=self.ticker,
+                        scaler=self.scaler,
+                        aligned_features_df=self.aligned_features_df,
+                        aligned_reg_targets_df=self.aligned_reg_targets_df,
+                        aligned_class_targets_df=self.aligned_class_targets_df,
+                        hmm=self.hmm,
+                        epochs=8
+                    )
+                retrain_online_rf(
+                    rf_reg=self.rf_reg,
+                    rf_clf=self.rf_clf,
+                    scaler=self.scaler,
+                    aligned_features_df=self.aligned_features_df,
+                    aligned_reg_targets_df=self.aligned_reg_targets_df,
+                    aligned_class_targets_df=self.aligned_class_targets_df,
+                    hmm=self.hmm
+                )
+            except Exception:
+                pass
+        
         # 1. Compile today's feature row
         X_all = extract_synthesis_features(
             self.data, self.metrics, self.cot_df, 
@@ -779,7 +1098,7 @@ class SynthesisPredictiveEngine:
                 'prob_bull': float(probs[2])
             }
             
-        return {
+        res = {
             'close_price': close_latest,
             'ml_model': _compile_prediction(rf_reg_pred, rf_clf_pred, rf_clf_probs),
             'nn_model': _compile_prediction(nn_reg_pred, nn_clf_pred, nn_cls_probs),
@@ -797,10 +1116,28 @@ class SynthesisPredictiveEngine:
                 'Volatility Distribution': float(latest_hmm_probs[sorted_states[2]])
             },
             'val_accuracy': self.val_accuracy,
-            'val_mse': self.val_mse
+            'val_mse': self.val_mse,
+            'concept_drift_event': drift_event_fired,
+            'concept_drift_rmse': rmse
         }
-
-
+        
+        # 4. Log the generated consensus prediction to SQLite ledger for next trading day
+        try:
+            pred_date = self.data.index[-1]
+            t_date = get_next_trading_day(pred_date)
+            log_prediction(
+                ticker=self.ticker,
+                prediction_date=str(pred_date.date()),
+                target_date=str(t_date.date()),
+                close_price=close_latest,
+                daily_vol=daily_vol_latest,
+                pred_dict=res['consensus']
+            )
+        except Exception:
+            pass
+            
+        return res
+        
 @cache_resource_decorator(ttl=900)
 def get_trained_predictive_engine(
     ticker: str,
@@ -828,8 +1165,8 @@ def get_trained_predictive_engine(
         daily_div_signals=_daily_div_signals,
         pivot_df=_pivot_df,
         lstm_series=_lstm_series,
-        event_df=_event_df
+        event_df=_event_df,
+        ticker=ticker
     )
     engine.train(epochs=predict_epochs)
     return engine
-
