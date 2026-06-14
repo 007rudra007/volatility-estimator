@@ -308,6 +308,33 @@ POPULAR_GLOBAL = [
 
 suffix = ".NS" if exchange == "NSE" else (".BO" if exchange == "BSE" else "")
 
+# Load recent tickers
+import json
+import os
+RECENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recent_tickers.json')
+
+def load_recent_tickers():
+    if os.path.exists(RECENT_FILE):
+        try:
+            with open(RECENT_FILE, 'r') as f:
+                return [t for t in json.load(f) if t]
+        except Exception:
+            return []
+    return []
+
+def save_recent_tickers(t_list):
+    try:
+        with open(RECENT_FILE, 'w') as f:
+            json.dump(t_list, f)
+    except Exception:
+        pass
+
+recent_list = load_recent_tickers()
+selected_recent = "Select..."
+if recent_list:
+    st.sidebar.markdown("### 🕒 Recent Tickers")
+    selected_recent = st.sidebar.selectbox("Quick reload recent searches", ["Select..."] + recent_list)
+
 # --- Custom ticker input (always visible at top) ---
 st.sidebar.markdown("### 🔍 Custom Ticker")
 custom_raw = st.sidebar.text_input(
@@ -325,7 +352,9 @@ auto_suffix = st.sidebar.checkbox(
     help=f"Automatically appends '{suffix}' if not already present. Disable for indices (^NSEI)."
 )
 
-if custom_raw.strip():
+if selected_recent != "Select...":
+    ticker = selected_recent
+elif custom_raw.strip():
     raw = custom_raw.strip().upper()
     if exchange != "Global" and auto_suffix and suffix and not raw.endswith(suffix) and not raw.startswith("^"):
         ticker = raw + suffix
@@ -724,6 +753,17 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         st.info("💡 Tip: Use .NS suffix for NSE stocks (e.g., RELIANCE.NS)")
     else:
         st.session_state['data_loaded'] = True
+        
+        # Save ticker to recent tickers list
+        try:
+            curr_list = load_recent_tickers()
+            if ticker in curr_list:
+                curr_list.remove(ticker)
+            curr_list.insert(0, ticker)
+            curr_list = curr_list[:8] # Keep 8 most recent
+            save_recent_tickers(curr_list)
+        except Exception:
+            pass
         
         # Calculate volatility metrics with dynamic SMA window
         metrics = calculate_metrics(data['Close'], sma_window=sma_window)
