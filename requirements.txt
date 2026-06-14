@@ -23,3 +23,7 @@ plotly>=5.18.0
 supabase>=2.3.0
 python-dotenv>=1.0.0
 
+# Machine Learning & Stats Model
+scikit-learn>=1.3.0
+
+
