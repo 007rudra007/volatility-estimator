@@ -220,6 +220,44 @@ st.markdown("""
             margin: 15mm;
         }
     }
+
+    /* Mobile responsive columns and layout styling */
+    @media (max-width: 768px) {
+        /* Force Streamlit horizontal columns to stack vertically on mobile */
+        [data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+            gap: 16px !important;
+        }
+        [data-testid="column"] {
+            width: 100% !important;
+            min-width: 100% !important;
+            max-width: 100% !important;
+            margin-bottom: 12px !important;
+        }
+        
+        /* Responsive font adjustments for mobile */
+        h1 {
+            font-size: 22px !important;
+        }
+        h2 {
+            font-size: 18px !important;
+        }
+        h3 {
+            font-size: 15px !important;
+        }
+        
+        /* Adjust page margins for compact mobile layout */
+        .block-container {
+            padding: 1rem !important;
+        }
+        
+        /* Ensure tables scroll horizontally instead of clipping */
+        table, [data-testid="stTable"] table {
+            width: 100% !important;
+            overflow-x: auto !important;
+            display: block !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -323,10 +361,10 @@ with col2:
 
 # Analysis options
 st.sidebar.markdown("### ⚙️ Analysis Options")
-show_garch = st.sidebar.checkbox("Enable GARCH(1,1) Forecast", value=False)
+show_garch = st.sidebar.checkbox("Enable GARCH(1,1) Forecast", value=True)
 show_egarch = st.sidebar.checkbox(
     "Enable EGARCH(1,1) Forecast",
-    value=False,
+    value=True,
     help="Exponential GARCH: adds γ (gamma) to capture the leverage effect (bearish shocks spike volatility harder)"
 )
 
@@ -334,7 +372,7 @@ from lstm_vol_engine import is_available as lstm_available
 _lstm_ready = lstm_available()
 show_lstm = st.sidebar.checkbox(
     "Enable GARCH→LSTM Forecast",
-    value=False,
+    value=True,
     disabled=not _lstm_ready,
     help="Pipes GARCH features into a stacked LSTM for multi-horizon volatility forecasting"
 )
@@ -383,7 +421,7 @@ else:
 st.sidebar.markdown("### 🧠 Predictive AI Options")
 show_predictor = st.sidebar.checkbox(
     "Enable Price & Trend AI Predictor",
-    value=False,
+    value=True,
     help="Trains a PyTorch Deep Neural Network and Random Forest to forecast daily range and weekly trend"
 )
 if show_predictor:
