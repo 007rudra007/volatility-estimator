@@ -3,10 +3,12 @@ predictive_engine.py - Machine Learning & Deep Learning Predictive Synthesis Eng
 
 Features:
 - Daily synthesis of all dashboard indicators (Price, Vol, COT, CVD, Waves, Fibs)
-- Targets builder for next-day intraday High/Low and 5-day weekly range/trend
+- CVD transformed to rolling 20-day Z-Score to maintain stationarity
+- Volatility-Normalized Targets: targets divided by GARCH daily standard deviation
+- Overlap-Purged Time-Series Split: 5-day purged gap to prevent target overlap leakage
 - Scikit-Learn Multi-Output Random Forest baseline
-- PyTorch Multi-Task ResNet MLP (Classification + Regression)
-- Consensus engine averaging forecasts
+- PyTorch Multi-Task ResNet MLP trained using Quantile (Pinball) Loss (10th/90th percentiles)
+- Consensus engine averaging and scaling back predicted Z-scores to price bounds
 """
 
 import numpy as np
@@ -45,6 +47,7 @@ def extract_synthesis_features(
 ) -> pd.DataFrame:
     """
     Synthesizes all dashboard indicators into a unified daily feature matrix.
+    Enforces stationarity on cumulative volume delta (CVD).
     """
     idx = data.index
     close = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
@@ -63,7 +66,6 @@ def extract_synthesis_features(
     # B. Volatilities
     for col in metrics.columns:
         if col != 'Log_Ret':
-            # Squeeze to handle potential series/dataframe mismatches
             vals = metrics[col].iloc[:, 0] if isinstance(metrics[col], pd.DataFrame) else metrics[col]
             features[f'vol_{col.lower()}'] = vals
             
@@ -91,13 +93,14 @@ def extract_synthesis_features(
         features['cot_index'] = 50.0
         features['speculator_net_pct'] = 0.0
         
-    # F. Cumulative Volume Delta (CVD)
+    # F. Cumulative Volume Delta (CVD) - Stationary Rolling Z-Score
     if daily_cvd is not None:
         cvd_val = daily_cvd.iloc[:, 0] if isinstance(daily_cvd, pd.DataFrame) else daily_cvd
-        features['cvd'] = cvd_val.fillna(0.0)
-        features['cvd_5d_slope'] = cvd_val.diff(5).fillna(0.0)
+        cvd_roll = cvd_val.rolling(window=20)
+        features['cvd_zscore'] = ((cvd_val - cvd_roll.mean()) / cvd_roll.std().replace(0, np.nan)).fillna(0.0)
+        features['cvd_5d_slope'] = (cvd_val.diff(5).fillna(0.0) / cvd_roll.std().replace(0, np.nan).fillna(1.0))
     else:
-        features['cvd'] = 0.0
+        features['cvd_zscore'] = 0.0
         features['cvd_5d_slope'] = 0.0
         
     if daily_div_signals is not None:
@@ -162,14 +165,14 @@ def extract_synthesis_features(
 
 
 # ==============================================================================
-# 2. Target Compilation
+# 2. Volatility-Normalized Target Compiler
 # ==============================================================================
 
-def build_synthesis_targets(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_synthesis_targets(data: pd.DataFrame, daily_vol: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compiles price high/low targets and weekly trend classifications.
-    - Regression: Next-day High/Low, Weekly Max High/Min Low (as relative % from Close).
-    - Classification: Weekly trend return classes (0 = Bearish, 1 = Neutral, 2 = Bullish).
+    All regression targets are Z-Scored (divided by GARCH daily volatility)
+    to standardize learning across regimes and assets.
     """
     close = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
     high = data['High'].iloc[:, 0] if isinstance(data['High'], pd.DataFrame) else data['High']
@@ -178,6 +181,7 @@ def build_synthesis_targets(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
     close_vals = close.values
     high_vals = high.values
     low_vals = low.values
+    vol_vals = daily_vol.values
     n = len(data)
     
     reg_targets = []
@@ -190,17 +194,20 @@ def build_synthesis_targets(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
             class_targets.append(np.nan)
             continue
             
-        # 1. Next-day Intraday High / Low
-        nd_high = (high_vals[t+1] / close_vals[t]) - 1.0
-        nd_low = (low_vals[t+1] / close_vals[t]) - 1.0
+        # Daily volatility threshold (prevent division by zero)
+        sigma = max(vol_vals[t], 0.0001)
         
-        # 2. Weekly (5-day) Max High / Min Low
+        # 1. Next-day Intraday High / Low (Z-Scored)
+        nd_high_z = ((high_vals[t+1] / close_vals[t]) - 1.0) / sigma
+        nd_low_z = ((low_vals[t+1] / close_vals[t]) - 1.0) / sigma
+        
+        # 2. Weekly (5-day) Max High / Min Low (Z-Scored)
         w_highs = high_vals[t+1 : t+6]
         w_lows = low_vals[t+1 : t+6]
-        w_max_high = (np.max(w_highs) / close_vals[t]) - 1.0
-        w_min_low = (np.min(w_lows) / close_vals[t]) - 1.0
+        w_max_high_z = ((np.max(w_highs) / close_vals[t]) - 1.0) / sigma
+        w_min_low_z = ((np.min(w_lows) / close_vals[t]) - 1.0) / sigma
         
-        # 3. Weekly Trend direction
+        # 3. Weekly Trend direction (Un-normalized % to maintain standard category checks)
         w_return = (close_vals[t+5] / close_vals[t]) - 1.0
         if w_return >= 0.015:
             trend = 2  # Bullish
@@ -209,7 +216,7 @@ def build_synthesis_targets(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
         else:
             trend = 1  # Neutral
             
-        reg_targets.append([nd_high, nd_low, w_max_high, w_min_low])
+        reg_targets.append([nd_high_z, nd_low_z, w_max_high_z, w_min_low_z])
         class_targets.append(trend)
         
     df_reg = pd.DataFrame(
@@ -227,10 +234,18 @@ def build_synthesis_targets(data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
 
 
 # ==============================================================================
-# 3. PyTorch Model Definition
+# 3. PyTorch Model Definition & Quantile Loss
 # ==============================================================================
 
 if TORCH_AVAILABLE:
+    def pinball_loss(pred, target, tau):
+        """
+        Quantile Loss function (Pinball Loss) for boundary estimations.
+        Highs are trained at tau = 0.90, Lows at tau = 0.10.
+        """
+        diff = target - pred
+        return torch.max(tau * diff, (tau - 1.0) * diff).mean()
+
     class SynthesisMultiTaskNet(nn.Module):
         """
         Deep Residual Multi-Task network outputting continuous levels (regression)
@@ -313,6 +328,12 @@ class SynthesisPredictiveEngine:
         self.val_mse = 0.0
         self.train_loss_history = []
         
+        # Establish daily GARCH volatility series
+        vol_series = self.metrics['Vol_20d'] if 'Vol_20d' in self.metrics.columns else (
+            self.metrics['Vol_20'] if 'Vol_20' in self.metrics.columns else self.metrics['EWMA']
+        )
+        self.daily_vol = (vol_series / np.sqrt(252)).ffill().bfill().fillna(0.02)
+        
     def _prepare_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Runs the extraction pipeline, aligns, and drop NaNs."""
         # 1. Feature matrix
@@ -322,8 +343,8 @@ class SynthesisPredictiveEngine:
         )
         self.features_count = X_df.shape[1]
         
-        # 2. Target matrices
-        y_reg_df, y_class_df = build_synthesis_targets(self.data)
+        # 2. Target matrices (with GARCH daily vol division)
+        y_reg_df, y_class_df = build_synthesis_targets(self.data, self.daily_vol)
         
         # Align: drop rows at the end where target is NaN (last 5 days)
         # also drop initial rows where rolling features are NaN
@@ -351,11 +372,16 @@ class SynthesisPredictiveEngine:
         # Scale features
         X_scaled = self.scaler.fit_transform(X).astype(np.float32)
         
-        # Train / Validation Split (80/20 chronological to avoid lookahead leakage)
+        # Chronological Train / Validation Split (80/20)
+        # Enforce a 5-day purging gap between sets to prevent target leakage
         split = int(n_samples * 0.8)
-        X_train, X_val = X_scaled[:split], X_scaled[split:]
-        y_reg_train, y_reg_val = y_reg[:split], y_reg[split:]
-        y_class_train, y_class_val = y_class[:split], y_class[split:]
+        X_train = X_scaled[:split - 5]
+        y_reg_train = y_reg[:split - 5]
+        y_class_train = y_class[:split - 5]
+        
+        X_val = X_scaled[split:]
+        y_reg_val = y_reg[split:]
+        y_class_val = y_class[split:]
         
         # --- A. Train Random Forest (ML Baseline) ---
         self.rf_reg.fit(X_train, y_reg_train)
@@ -379,8 +405,7 @@ class SynthesisPredictiveEngine:
             model = SynthesisMultiTaskNet(input_size=self.features_count, hidden_size=64)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
             
-            # Loss Functions
-            reg_loss_fn = nn.HuberLoss(delta=0.01) # Huber robusts relative % outlier changes
+            # Loss Functions: Quantile pinball for regression bounds + CrossEntropy for classification
             class_loss_fn = nn.CrossEntropyLoss()
             
             self.train_loss_history = []
@@ -392,10 +417,15 @@ class SynthesisPredictiveEngine:
                     optimizer.zero_grad()
                     pred_reg, pred_class = model(Xb)
                     
-                    l_reg = reg_loss_fn(pred_reg, yrb)
+                    # Quantile loss on regressor bounds
+                    l_nd_high = pinball_loss(pred_reg[:, 0], yrb[:, 0], 0.90)  # High bounds targeting 90th pct
+                    l_nd_low = pinball_loss(pred_reg[:, 1], yrb[:, 1], 0.10)   # Low bounds targeting 10th pct
+                    l_w_high = pinball_loss(pred_reg[:, 2], yrb[:, 2], 0.90)
+                    l_w_low = pinball_loss(pred_reg[:, 3], yrb[:, 3], 0.10)
+                    
+                    l_reg = l_nd_high + l_nd_low + l_w_high + l_w_low
                     l_class = class_loss_fn(pred_class, ycb)
                     
-                    # Combine losses, scaling classification to balance scales
                     loss = l_reg + 0.2 * l_class
                     loss.backward()
                     optimizer.step()
@@ -407,7 +437,6 @@ class SynthesisPredictiveEngine:
                 if progress_callback:
                     progress_callback(epoch + 1, epochs, epoch_loss)
                     
-            # Set trained weights
             self.nn_model = model
             model.eval()
             
@@ -418,11 +447,9 @@ class SynthesisPredictiveEngine:
                 nn_reg = nn_reg.cpu().numpy()
                 nn_cls_lbl = torch.argmax(nn_cls, dim=1).cpu().numpy()
                 
-                # Combine validation metrics (simple weighted average of ML + NN)
                 nn_mse = float(mean_squared_error(y_reg_val, nn_reg))
                 nn_acc = float(accuracy_score(y_class_val, nn_cls_lbl))
                 
-                # Report best metrics of PyTorch or RF
                 self.val_mse = min(self.val_mse, nn_mse)
                 self.val_accuracy = max(self.val_accuracy, nn_acc)
                 
@@ -437,7 +464,8 @@ class SynthesisPredictiveEngine:
     def predict_latest(self) -> Dict:
         """
         Runs predictions on the very latest data row to project
-        intraday range and weekly trend.
+        intraday range and weekly trend. Scales the predicted Z-Scores back 
+        to price levels using the latest GARCH daily volatility.
         """
         if not self.is_trained:
             raise RuntimeError("Engine must be trained before predicting.")
@@ -451,6 +479,7 @@ class SynthesisPredictiveEngine:
         latest_row_scaled = self.scaler.transform(latest_row).astype(np.float32)
         
         close_latest = float(self.data['Close'].dropna().iloc[-1])
+        daily_vol_latest = float(max(self.daily_vol.iloc[-1], 0.0001))
         
         # A. Random Forest Predictions
         rf_reg_pred = self.rf_reg.predict(latest_row_scaled)[0]
@@ -479,11 +508,13 @@ class SynthesisPredictiveEngine:
         trend_map = {0: 'Bearish Breakdown', 1: 'Neutral Range', 2: 'Bullish Breakout'}
         
         def _compile_prediction(reg, trend_idx, probs):
+            # Scale the Z-Score regressor outputs back to absolute prices
+            # target_price = close * (1.0 + z_score * vol_daily)
             return {
-                'nd_high': close_latest * (1.0 + reg[0]),
-                'nd_low': close_latest * (1.0 + reg[1]),
-                'weekly_high': close_latest * (1.0 + reg[2]),
-                'weekly_low': close_latest * (1.0 + reg[3]),
+                'nd_high': close_latest * (1.0 + reg[0] * daily_vol_latest),
+                'nd_low': close_latest * (1.0 + reg[1] * daily_vol_latest),
+                'weekly_high': close_latest * (1.0 + reg[2] * daily_vol_latest),
+                'weekly_low': close_latest * (1.0 + reg[3] * daily_vol_latest),
                 'trend': trend_map[trend_idx],
                 'prob_bear': float(probs[0]),
                 'prob_neut': float(probs[1]),

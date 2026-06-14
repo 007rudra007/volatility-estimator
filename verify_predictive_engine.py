@@ -68,7 +68,8 @@ def run_verification():
     
     # 3. Target Compiler Check
     print("Compiling targets...")
-    y_reg, y_class = predictive_engine.build_synthesis_targets(df)
+    daily_vol_mock = pd.Series([0.02] * len(df), index=df.index)
+    y_reg, y_class = predictive_engine.build_synthesis_targets(df, daily_vol_mock)
     assert y_reg.shape[0] == n, "Targets rows size mismatch"
     assert y_class.shape[0] == n, "Classification target size mismatch"
     print("[OK] Targets matrices compiled.")

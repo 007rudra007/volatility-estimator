@@ -541,6 +541,34 @@ def fetch_intraday_hl(ticker: str) -> dict:
     except Exception as e:
         return None
 
+@st.cache_data(ttl=900)  # Cache model projections for 15 minutes to maximize app speed
+def run_cached_prediction_pipeline(
+    ticker: str,
+    data: pd.DataFrame,
+    metrics: pd.DataFrame,
+    cot_df: pd.DataFrame,
+    daily_cvd: pd.Series,
+    daily_div_signals: pd.Series,
+    pivot_df: pd.DataFrame,
+    show_wave_fib: bool,
+    predict_epochs: int
+) -> dict:
+    """Trains synthesis predictor models once and caches inference outputs in memory."""
+    import predictive_engine
+    
+    pred_engine = predictive_engine.SynthesisPredictiveEngine(
+        data=data,
+        metrics=metrics,
+        cot_df=cot_df,
+        daily_cvd=daily_cvd,
+        daily_div_signals=daily_div_signals,
+        pivot_df=pivot_df if (show_wave_fib and pivot_df is not None) else None
+    )
+    
+    # Train the models (no progress bar inside cached data call to prevent Streamlit widget serialization issues)
+    pred_engine.train(epochs=predict_epochs)
+    return pred_engine.predict_latest()
+
 def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame, current_price: float = None) -> dict:
     """
     Derive statistical price targets from realized vol, ATR, and Bollinger Bands.
@@ -771,36 +799,25 @@ if analyze_clicked or 'data_loaded' in st.session_state:
             # 6. Get Fibonacci Volatility Bands
             fib_bands = wave_theory.calculate_fib_vol_bands(data['Close'], metrics[vol_col], window=20)
             
-        # AI Predictive Synthesis Calculations
+        # AI Predictive Synthesis Calculations (using cached data pipeline)
         if show_predictor:
-            import predictive_engine
-            
-            # Setup indicators
-            pred_engine = predictive_engine.SynthesisPredictiveEngine(
-                data=data,
-                metrics=metrics,
-                cot_df=cot_df,
-                daily_cvd=daily_cvd,
-                daily_div_signals=daily_div_signals,
-                pivot_df=pivot_df if (show_wave_fib and 'pivot_df' in locals()) else None
-            )
-            
-            # Show progress bar in Streamlit
-            progress_bar = st.progress(0, text="Initializing Synthesis AI Models...")
-            def _pred_progress(epoch, total, loss):
-                pct = int(epoch / total * 100)
-                progress_bar.progress(pct, text=f"Training Predictive NN - epoch {epoch}/{total} | loss {loss:.5f}")
-                
             with st.spinner("Training ML baseline & Deep Learning Neural Network..."):
                 try:
-                    pred_engine.train(epochs=predict_epochs, progress_callback=_pred_progress)
-                    progress_bar.progress(100, text="✅ AI Model Training Complete")
-                    predictions_dict = pred_engine.predict_latest()
+                    predictions_dict = run_cached_prediction_pipeline(
+                        ticker=ticker,
+                        data=data,
+                        metrics=metrics,
+                        cot_df=cot_df,
+                        daily_cvd=daily_cvd,
+                        daily_div_signals=daily_div_signals,
+                        pivot_df=pivot_df if (show_wave_fib and 'pivot_df' in locals()) else None,
+                        show_wave_fib=show_wave_fib,
+                        predict_epochs=predict_epochs
+                    )
                     st.session_state['_predictions_dict_cache'] = predictions_dict
                 except Exception as e:
                     st.error(f"Predictive Engine training failed: {e}")
                     st.session_state['_predictions_dict_cache'] = None
-            progress_bar.empty()
         else:
             st.session_state['_predictions_dict_cache'] = None
             
