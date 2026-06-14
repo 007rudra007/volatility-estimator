@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Indian Volatility Risk Dashboard</title>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- External Libraries CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- App Container -->
+    <div class="app-container">
+        
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-main">
+                <div class="title-group">
+                    <span class="flag-icon">🇮🇳</span>
+                    <h1>Volatility Risk Dashboard</h1>
+                </div>
+                <button id="btn-settings" class="icon-button" title="Configure Connection">⚙️</button>
+            </div>
+            
+            <!-- Controls Grid -->
+            <div class="controls-grid">
+                <div class="select-wrapper">
+                    <label for="select-ticker">Select Watchlist Ticker</label>
+                    <select id="select-ticker" disabled>
+                        <option value="">Loading tickers...</option>
+                    </select>
+                </div>
+                <button id="btn-refresh" class="btn-primary" disabled>Refresh Data</button>
+            </div>
+        </header>
+
+        <!-- Notification Banner -->
+        <div id="connection-alert" class="alert-banner warning">
+            ⚠️ Supabase connection not configured. Tap the ⚙️ icon to set up keys.
+        </div>
+
+        <!-- Main Dashboard content (hidden until connected) -->
+        <main id="dashboard-content" class="dashboard-grid hidden">
+            
+            <!-- Summary Stats Cards Row -->
+            <section class="stats-row">
+                <!-- Card 1: Current Regime -->
+                <div class="stat-card" id="card-regime">
+                    <h3>Risk Regime</h3>
+                    <div class="value" id="val-regime">—</div>
+                    <div class="sub-label" id="val-percentile">— percentile</div>
+                </div>
+                
+                <!-- Card 2: Current Spot -->
+                <div class="stat-card">
+                    <h3>Last Close</h3>
+                    <div class="value" id="val-spot">—</div>
+                    <div class="sub-label" id="val-change">—</div>
+                </div>
+                
+                <!-- Card 3: Gamma Flip -->
+                <div class="stat-card">
+                    <h3>Gamma Flip</h3>
+                    <div class="value" id="val-flip">—</div>
+                    <div class="sub-label" id="val-gex-regime">—</div>
+                </div>
+                
+                <!-- Card 4: RVOL -->
+                <div class="stat-card" id="card-rvol">
+                    <h3>Relative Volume</h3>
+                    <div class="value" id="val-rvol">—</div>
+                    <div class="sub-label" id="val-volume-regime">—</div>
+                </div>
+            </section>
+
+            <!-- Chart Section 1: Price & Volatility -->
+            <section class="chart-card">
+                <div class="chart-header">
+                    <h2>Price & Realized Volatility</h2>
+                    <span class="badge">Ann. Volatility</span>
+                </div>
+                <div class="chart-container" id="chart-price-vol"></div>
+            </section>
+
+            <!-- Chart Section 2: Option GEX Profile -->
+            <section class="chart-card">
+                <div class="chart-header">
+                    <h2>Options Gamma Exposure (GEX)</h2>
+                    <span class="badge" id="badge-gex-type">Strike Exposure</span>
+                </div>
+                <div class="chart-container" id="chart-gex"></div>
+            </section>
+
+            <!-- Chart Section 3: Cumulative Volume Delta (CVD) -->
+            <section class="chart-card">
+                <div class="chart-header">
+                    <h2>Cumulative Volume Delta (CVD)</h2>
+                    <span class="badge">Order Flow Momentum</span>
+                </div>
+                <div class="chart-container" id="chart-cvd"></div>
+            </section>
+
+            <!-- Chart Section 4: Institutional net positioning -->
+            <section class="chart-card">
+                <div class="chart-header">
+                    <h2>Institutional Futures Net Positioning</h2>
+                    <span class="badge" id="badge-positioning">Speculators vs Commercials</span>
+                </div>
+                <div class="chart-container" id="chart-positioning"></div>
+            </section>
+
+            <!-- Section 5: Macro Events -->
+            <section class="table-card">
+                <div class="table-header">
+                    <h2>Upcoming & Recent Macro Events</h2>
+                </div>
+                <div class="table-responsive">
+                    <table id="table-events">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Event Type</th>
+                                <th>Outcome</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="3" class="text-center">Loading macro events...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+        </main>
+        
+        <!-- App Footer -->
+        <footer class="app-footer">
+            <p>Volatility Risk Dashboard v1.0 • Connected to Supabase</p>
+        </footer>
+    </div>
+
+    <!-- Credentials configuration Modal -->
+    <div id="modal-settings" class="modal-overlay hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Supabase Credentials</h2>
+                <button id="btn-close-settings" class="icon-button">✕</button>
+            </div>
+            <p class="modal-desc">
+                Credentials are saved locally in your mobile browser storage. They are never transmitted or saved to GitHub.
+            </p>
+            <div class="form-group">
+                <label for="input-url">Supabase Project URL</label>
+                <input type="url" id="input-url" placeholder="https://your-project-id.supabase.co">
+            </div>
+            <div class="form-group">
+                <label for="input-key">Supabase Public API Key (anon)</label>
+                <input type="password" id="input-key" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
+            </div>
+            <div class="modal-actions">
+                <button id="btn-save-settings" class="btn-primary">Save Config</button>
+                <button id="btn-clear-settings" class="btn-danger">Clear Config</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
