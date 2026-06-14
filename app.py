@@ -551,7 +551,9 @@ def run_cached_prediction_pipeline(
     daily_cvd: pd.Series,
     daily_div_signals: pd.Series,
     pivot_df: pd.DataFrame,
-    predict_epochs: int
+    predict_epochs: int,
+    lstm_series: pd.Series = None,
+    event_df: pd.DataFrame = None
 ) -> dict:
     """Trains/retrieves synthesis predictor models cached in global RAM and runs inference."""
     import predictive_engine
@@ -567,7 +569,9 @@ def run_cached_prediction_pipeline(
         _daily_cvd=daily_cvd,
         _daily_div_signals=daily_div_signals,
         _pivot_df=pivot_df,
-        predict_epochs=predict_epochs
+        predict_epochs=predict_epochs,
+        _lstm_series=lstm_series,
+        _event_df=event_df
     )
     
     return pred_engine.predict_latest()
@@ -808,6 +812,12 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         if show_predictor:
             with st.spinner("Training ML baseline & Deep Learning Neural Network..."):
                 try:
+                    # Retrieve cached LSTM forecast series if available in session state
+                    lstm_series_val = None
+                    lstm_cached = st.session_state.get('_lstm_result_cache')
+                    if lstm_cached and 'in_sample_sigma' in lstm_cached:
+                        lstm_series_val = lstm_cached['in_sample_sigma']
+                        
                     predictions_dict = run_cached_prediction_pipeline(
                         ticker=ticker,
                         start_date=str(start_date),
@@ -818,7 +828,9 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                         daily_cvd=daily_cvd,
                         daily_div_signals=daily_div_signals,
                         pivot_df=pivot_df,
-                        predict_epochs=predict_epochs
+                        predict_epochs=predict_epochs,
+                        lstm_series=lstm_series_val,
+                        event_df=events_df if 'events_df' in locals() else None
                     )
                     st.session_state['_predictions_dict_cache'] = predictions_dict
                 except Exception as e:
@@ -978,6 +990,9 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                         help="Predicted high and low price levels for the next trading session."
                     )
                     st.caption(f"**Expected range:** ₹{(consensus['nd_high'] - consensus['nd_low']):,.2f} ({((consensus['nd_high']/consensus['nd_low']) - 1.0)*100:.2f}%)")
+                    if 'conformal' in pred_res:
+                        conf = pred_res['conformal']
+                        st.caption(f"🛡️ **95% Conformal:** ₹{conf['nd_low']:,.2f} - ₹{conf['nd_high']:,.2f}")
                     
                 with pcol2:
                     st.metric(
@@ -986,6 +1001,9 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                         help="Predicted high and low price levels for the next 5 trading sessions."
                     )
                     st.caption(f"**Weekly Spread:** ₹{(consensus['weekly_high'] - consensus['weekly_low']):,.2f} ({((consensus['weekly_high']/consensus['weekly_low']) - 1.0)*100:.2f}%)")
+                    if 'conformal' in pred_res:
+                        conf = pred_res['conformal']
+                        st.caption(f"🛡️ **95% Conformal:** ₹{conf['weekly_low']:,.2f} - ₹{conf['weekly_high']:,.2f}")
                     
                 with pcol3:
                     trend_lbl = consensus['trend']
@@ -1045,6 +1063,27 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                     """,
                     unsafe_allow_html=True
                 )
+                
+                if 'hmm_regime' in pred_res:
+                    regime = pred_res['hmm_regime']
+                    probs = pred_res['hmm_probs']
+                    st.markdown(
+                        f"""
+                        <div style="border-left: 4px solid #7C3AED; padding: 10px 16px; background: #F9FAFB; border-radius: 0 8px 8px 0; margin-bottom: 16px;">
+                            <span style="font-size: 11px; font-weight: 700; color: #7C3AED; text-transform: uppercase;">Hidden Markov Model (HMM) Active Regime</span>
+                            <br>
+                            <span style="font-size: 14px; font-weight: 700; color: #111827;">{regime.upper()}</span>
+                            <br>
+                            <span style="font-size: 12px; color: #6B7280;">
+                                Probabilities: 
+                                Rotational Grind: <strong>{probs['Rotational Grind']*100:.1f}%</strong> &middot; 
+                                Neutral Range: <strong>{probs['Neutral Range']*100:.1f}%</strong> &middot; 
+                                Volatility Distribution: <strong>{probs['Volatility Distribution']*100:.1f}%</strong>
+                            </span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
                 
                 st.divider()
 
@@ -1138,6 +1177,7 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                             from lstm_vol_engine import GARCHLSTMForecaster
                             forecaster = GARCHLSTMForecaster(returns=metrics['Log_Ret'], garch_params=_garch_for_lstm, epochs=80, seq_len=30)
                             lstm_result = forecaster.run(progress_callback=_lstm_progress)
+                            st.session_state['_lstm_result_cache'] = lstm_result
                             lstm_progress_bar.progress(100, text="✅ Training complete")
                             lstm_ok = True
                         except Exception as _lstm_err:

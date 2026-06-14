@@ -40,14 +40,90 @@ except ImportError:
     HAS_STREAMLIT = False
 
 def cache_data_decorator(*args, **kwargs):
-    if HAS_STREAMLIT:
+    if HAS_STREAMLIT and st.runtime.exists():
         return st.cache_data(*args, **kwargs)
     return lambda f: f
 
 def cache_resource_decorator(*args, **kwargs):
-    if HAS_STREAMLIT:
+    if HAS_STREAMLIT and st.runtime.exists():
         return st.cache_resource(*args, **kwargs)
     return lambda f: f
+
+
+def compute_rolling_cvar(returns_series: pd.Series, window: int = 20, alpha: float = 0.05) -> pd.Series:
+    """Computes rolling Conditional Value at Risk (CVaR) at the specified alpha level."""
+    def cvar_helper(w):
+        var = np.percentile(w, alpha * 100)
+        below_var = w[w <= var]
+        return float(below_var.mean()) if len(below_var) > 0 else float(var)
+    return returns_series.rolling(window).apply(cvar_helper).fillna(0.0)
+
+
+def compute_rolling_hurst(returns_series: pd.Series, window: int = 63) -> pd.Series:
+    """Computes rolling Hurst exponent using R/S analysis proxy."""
+    ret_vals = returns_series.fillna(0.0).values
+    n = len(ret_vals)
+    hurst_vals = np.zeros(n)
+    hurst_vals[:window] = 0.5
+    for t in range(window, n):
+        w = ret_vals[t - window : t]
+        try:
+            lags = [8, 16, 32, 48]
+            tau = [float(np.std(w[lag:] - w[:-lag])) for lag in lags]
+            poly = np.polyfit(np.log(lags), np.log(tau), 1)
+            hurst_vals[t] = float(poly[0] * 2.0)
+        except:
+            hurst_vals[t] = 0.5
+    return pd.Series(np.clip(hurst_vals, 0.0, 1.0), index=returns_series.index)
+
+
+class RegimeSwitchHMM:
+    """
+    Gaussian Mixture Model-based Markov regime switching model.
+    Partitions market state into unobserved components (regimes) and estimates
+    transition probabilities between them.
+    """
+    def __init__(self, n_states: int = 3):
+        from sklearn.mixture import GaussianMixture
+        self.n_states = n_states
+        self.gmm = GaussianMixture(n_components=n_states, covariance_type='full', random_state=42)
+        self.transitions = None
+        self.is_fitted = False
+        
+    def fit(self, X: np.ndarray) -> np.ndarray:
+        # Fit GMM to assign states
+        states = self.gmm.fit_predict(X)
+        
+        # Compute transition matrix A
+        n = len(states)
+        A = np.zeros((self.n_states, self.n_states))
+        for t in range(1, n):
+            A[states[t-1], states[t]] += 1
+            
+        # Normalize rows to transition probabilities
+        row_sums = A.sum(axis=1, keepdims=True)
+        self.transitions = np.where(row_sums > 0, A / row_sums, 1.0 / self.n_states)
+        self.is_fitted = True
+        return states
+        
+    def predict_state_probs(self, X: np.ndarray) -> np.ndarray:
+        # X shape: (N, n_features)
+        if not self.is_fitted:
+            return np.ones((len(X), self.n_states)) / self.n_states
+        # Get emission probabilities from GMM
+        gmm_probs = self.gmm.predict_proba(X) # shape: (N, n_states)
+        
+        # Predict next-state probabilities using transition matrix: P(S_{t+1}) = P(S_t) * A
+        pred_probs = np.zeros_like(gmm_probs)
+        pred_probs[0] = gmm_probs[0]
+        for t in range(1, len(X)):
+            pred_probs[t] = np.dot(pred_probs[t-1], self.transitions) * gmm_probs[t]
+            row_sum = pred_probs[t].sum()
+            if row_sum > 0:
+                pred_probs[t] /= row_sum
+            else:
+                pred_probs[t] = gmm_probs[t]
+        return pred_probs
 
 
 # ==============================================================================
@@ -61,16 +137,19 @@ def extract_synthesis_features(
     cot_df: pd.DataFrame, 
     daily_cvd: pd.Series, 
     daily_div_signals: pd.Series, 
-    pivot_df: pd.DataFrame
+    pivot_df: pd.DataFrame,
+    lstm_series: pd.Series = None,
+    event_df: pd.DataFrame = None
 ) -> pd.DataFrame:
     """
-    Synthesizes all dashboard indicators into a unified daily feature matrix.
-    Enforces stationarity on cumulative volume delta (CVD).
+    Synthesizes all dashboard indicators into a unified daily feature matrix X_t.
+    Ensures all scale properties are standardized and stationary.
     """
     idx = data.index
     close = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
     high = data['High'].iloc[:, 0] if isinstance(data['High'], pd.DataFrame) else data['High']
     low = data['Low'].iloc[:, 0] if isinstance(data['Low'], pd.DataFrame) else data['Low']
+    volume = data['Volume'].iloc[:, 0] if isinstance(data['Volume'], pd.DataFrame) else data['Volume']
     
     features = pd.DataFrame(index=idx)
     
@@ -79,7 +158,8 @@ def extract_synthesis_features(
     ma50 = close.rolling(50).mean()
     features['close_to_ma20'] = (close / ma20.replace(0, np.nan) - 1.0).fillna(0.0)
     features['close_to_ma50'] = (close / ma50.replace(0, np.nan) - 1.0).fillna(0.0)
-    features['log_returns'] = np.log(close / close.shift(1).replace(0, np.nan)).fillna(0.0)
+    log_ret = np.log(close / close.shift(1).replace(0, np.nan)).fillna(0.0)
+    features['log_returns'] = log_ret
     
     # B. Volatilities
     for col in metrics.columns:
@@ -94,21 +174,21 @@ def extract_synthesis_features(
         middle = data['Donchian_Middle'].iloc[:, 0] if isinstance(data['Donchian_Middle'], pd.DataFrame) else data['Donchian_Middle']
         features['donchian_width'] = ((upper - lower) / middle.replace(0, np.nan)).fillna(0.0)
         
-    # D. Volume metrics
+    # D. Volume metrics (RVOL)
     if 'RVOL' in data.columns:
         rvol_s = data['RVOL'].iloc[:, 0] if isinstance(data['RVOL'], pd.DataFrame) else data['RVOL']
         features['rvol'] = rvol_s.fillna(1.0)
     else:
         features['rvol'] = 1.0
         
-    # E. COT derivative positioning
+    # E. COT positioning index
     if cot_df is not None and not cot_df.empty:
         cot_idx = cot_df['COT_Index'].iloc[:, 0] if isinstance(cot_df['COT_Index'], pd.DataFrame) else cot_df['COT_Index']
         spec_net = cot_df['Speculator_Net'].iloc[:, 0] if isinstance(cot_df['Speculator_Net'], pd.DataFrame) else cot_df['Speculator_Net']
-        features['cot_index'] = cot_idx.fillna(50.0)
+        features['cot_index'] = (cot_idx.fillna(50.0) / 100.0)  # Standardized to [0, 1]
         features['speculator_net_pct'] = (spec_net / spec_net.abs().rolling(252).mean().replace(0, np.nan)).fillna(0.0)
     else:
-        features['cot_index'] = 50.0
+        features['cot_index'] = 0.5
         features['speculator_net_pct'] = 0.0
         
     # F. Cumulative Volume Delta (CVD) - Stationary Rolling Z-Score
@@ -117,15 +197,23 @@ def extract_synthesis_features(
         cvd_roll = cvd_val.rolling(window=20)
         features['cvd_zscore'] = ((cvd_val - cvd_roll.mean()) / cvd_roll.std().replace(0, np.nan)).fillna(0.0)
         features['cvd_5d_slope'] = (cvd_val.diff(5).fillna(0.0) / cvd_roll.std().replace(0, np.nan).fillna(1.0))
+        
+        # One-Hot encoding of daily CVD divergence signals: Bullish (1), Bearish (-1), Neutral (0)
+        if daily_div_signals is not None:
+            div_sig = daily_div_signals.iloc[:, 0] if isinstance(daily_div_signals, pd.DataFrame) else daily_div_signals
+            features['cvd_div_bull'] = (div_sig == 1.0).astype(float)
+            features['cvd_div_bear'] = (div_sig == -1.0).astype(float)
+            features['cvd_div_neut'] = (div_sig == 0.0).astype(float)
+        else:
+            features['cvd_div_bull'] = 0.0
+            features['cvd_div_bear'] = 0.0
+            features['cvd_div_neut'] = 1.0
     else:
         features['cvd_zscore'] = 0.0
         features['cvd_5d_slope'] = 0.0
-        
-    if daily_div_signals is not None:
-        div_sig = daily_div_signals.iloc[:, 0] if isinstance(daily_div_signals, pd.DataFrame) else daily_div_signals
-        features['cvd_div_sig'] = div_sig.fillna(0.0)
-    else:
-        features['cvd_div_sig'] = 0.0
+        features['cvd_div_bull'] = 0.0
+        features['cvd_div_bear'] = 0.0
+        features['cvd_div_neut'] = 1.0
         
     # G. Wave & Fibonacci
     if pivot_df is not None and not pivot_df.empty:
@@ -178,7 +266,93 @@ def extract_synthesis_features(
         features['last_pivot_type'] = 0.0
         features['fib_0_dist'] = 0.0
         features['fib_618_dist'] = 0.0
+
+    # H. VOLATILITY & RISK PROFILE (Tensor 1)
+    ewma_vol = metrics['EWMA'].iloc[:, 0] if isinstance(metrics['EWMA'], pd.DataFrame) else metrics['EWMA']
+    
+    # Simple estimate of daily vol based on EWMA
+    daily_vol = (ewma_vol / np.sqrt(252)).ffill().bfill().fillna(0.02)
+    daily_vol_ann = daily_vol * np.sqrt(252)
+
+    if lstm_series is not None:
+        lstm_s = lstm_series.reindex(idx).ffill().bfill().fillna(daily_vol_ann)
+        features['lstm_garch_delta'] = ((lstm_s - daily_vol_ann) / daily_vol_ann.replace(0, 1e-4)).fillna(0.0)
+    else:
+        # Fallback to rolling std vs EWMA delta
+        vol_20d = metrics['Vol_20d'].iloc[:, 0] if isinstance(metrics['Vol_20d'], pd.DataFrame) else metrics['Vol_20d']
+        features['lstm_garch_delta'] = ((vol_20d - ewma_vol) / ewma_vol.replace(0, 1e-4)).fillna(0.0)
+
+    features['vol_percentile'] = ewma_vol.rolling(252).rank(pct=True).fillna(0.5)
+    
+    # CVaR Tail Risk ratio helper
+    features['cvar_ratio'] = compute_rolling_cvar(log_ret, window=20, alpha=0.05)
+
+    # I. STRUCTURAL MEMORY & TIME SERIES (Tensor 2)
+    features['hurst'] = compute_rolling_hurst(log_ret, window=63)
+    features['arima_drift'] = log_ret.rolling(20).corr(log_ret.shift(1)).fillna(0.0)
+    features['mc_bias'] = (log_ret.rolling(20).mean() / log_ret.rolling(20).std().replace(0, np.nan)).fillna(0.0)
+
+    # J. OPTIONS GRAVITY MATRIX (Tensor 3)
+    # Generate historical synthetic GEX and Gamma Flip levels
+    net_gex_pins = []
+    gamma_flips = []
+    import confirmations_engine as ce
+    for t_idx in idx:
+        spot = float(close.loc[t_idx])
+        vol = float(ewma_vol.loc[t_idx])
+        # Generate synthetic GEX profile
+        gex_profile = ce.get_synthetic_gex_profile(spot, vol)
+        levels = ce.extract_gex_key_levels(gex_profile, spot)
+        net_gex_pins.append(levels.get('peak_net_strike', spot))
+        gamma_flips.append(levels.get('flip_price', spot))
         
+    gex_pin_s = pd.Series(net_gex_pins, index=idx)
+    gamma_flip_s = pd.Series(gamma_flips, index=idx)
+    
+    features['dist_to_gex_pin'] = (gex_pin_s - close) / close
+    features['dist_to_gamma_flip'] = (gamma_flip_s - close) / close
+    
+    # Standard normal CDF for option breach probability
+    from scipy.stats import norm
+    dist_sd = features['dist_to_gamma_flip'].abs() / (daily_vol * np.sqrt(10))
+    features['breach_prob'] = pd.Series(2.0 * (1.0 - norm.cdf(dist_sd)), index=idx).fillna(0.0)
+
+    # K. MACRO & EVENT PROXIMITY (Tensor 5)
+    event_dates = []
+    event_types_map = {}
+    if event_df is not None and not event_df.empty:
+        for _, row in event_df.iterrows():
+            dt = pd.Timestamp(row['Date'])
+            event_dates.append(dt)
+            event_types_map[dt] = row['Event_Type']
+            
+    vol_impact_dict = {
+        'RBI MPC': -0.234,      # post-meeting vol crush
+        'CPI Release': 0.125,    # inflation day expansion
+        'Union Budget': 0.284,   # high expansion
+        'US Fed Meeting': 0.085  # standard expansion
+    }
+    
+    days_to_event_series = []
+    event_impact_series = []
+    for t_idx in idx:
+        future_evs = [ev for ev in event_dates if ev > t_idx]
+        if future_evs:
+            next_ev = future_evs[0]
+            days_to_event_series.append(float((next_ev - t_idx).days))
+            ev_type = event_types_map.get(next_ev, 'Other')
+            event_impact_series.append(vol_impact_dict.get(ev_type, 0.0))
+        else:
+            days_to_event_series.append(30.0)
+            event_impact_series.append(0.0)
+            
+    features['days_to_event'] = days_to_event_series
+    features['event_vol_impact'] = event_impact_series
+
+    # L. MICROSTRUCTURE ORDER BOOK IMPLANCE (OBI)
+    # EOD proxy representing the buyers/sellers imbalance ratio from Cumulative Volume Delta (CVD)
+    features['obi'] = (daily_cvd.diff().fillna(0.0) / volume.replace(0, 1.0)).clip(-1.0, 1.0).fillna(0.0)
+
     return features.ffill().bfill().fillna(0.0)
 
 
@@ -323,7 +497,9 @@ class SynthesisPredictiveEngine:
         cot_df: pd.DataFrame,
         daily_cvd: pd.Series,
         daily_div_signals: pd.Series,
-        pivot_df: pd.DataFrame
+        pivot_df: pd.DataFrame,
+        lstm_series: pd.Series = None,
+        event_df: pd.DataFrame = None
     ):
         self.data = data
         self.metrics = metrics
@@ -331,6 +507,8 @@ class SynthesisPredictiveEngine:
         self.daily_cvd = daily_cvd
         self.daily_div_signals = daily_div_signals
         self.pivot_df = pivot_df
+        self.lstm_series = lstm_series
+        self.event_df = event_df
         
         self.scaler = StandardScaler()
         self.rf_reg = RandomForestRegressor(n_estimators=100, random_state=42)
@@ -373,7 +551,8 @@ class SynthesisPredictiveEngine:
         # 1. Feature matrix
         X_df = extract_synthesis_features(
             self.data, self.metrics, self.cot_df, 
-            self.daily_cvd, self.daily_div_signals, self.pivot_df
+            self.daily_cvd, self.daily_div_signals, self.pivot_df,
+            lstm_series=self.lstm_series, event_df=self.event_df
         )
         self.features_count = X_df.shape[1]
         
@@ -395,7 +574,7 @@ class SynthesisPredictiveEngine:
         return X, y_reg, y_class
         
     def train(self, epochs: int = 50, progress_callback=None) -> Dict:
-        """Trains both standard ML models and Deep PyTorch Network."""
+        """Trains Hidden Markov Model, Random Forest models & PyTorch Multi-Task Net."""
         X, y_reg, y_class = self._prepare_data()
         n_samples = len(X)
         self.train_samples = n_samples
@@ -403,8 +582,18 @@ class SynthesisPredictiveEngine:
         if n_samples < 20:
             raise ValueError(f"Insufficient historical samples to train AI models (need >20, got {n_samples}). Try increasing the date range.")
             
+        # Fit RegimeSwitchHMM on returns (index 2) and vol (index 3)
+        hmm_feats = X[:, [2, 3]]
+        self.hmm = RegimeSwitchHMM(n_states=3)
+        self.hmm.fit(hmm_feats)
+        hmm_probs = self.hmm.predict_state_probs(hmm_feats)
+        
+        # Extend features X with HMM state probabilities
+        X_extended = np.hstack([X, hmm_probs])
+        self.features_count = X_extended.shape[1]
+        
         # Scale features
-        X_scaled = self.scaler.fit_transform(X).astype(np.float32)
+        X_scaled = self.scaler.fit_transform(X_extended).astype(np.float32)
         
         # Chronological Train / Validation Split (80/20)
         # Enforce a 5-day purging gap between sets to prevent target leakage
@@ -428,6 +617,9 @@ class SynthesisPredictiveEngine:
         self.val_accuracy = float(accuracy_score(y_class_val, rf_clf_pred))
         
         # --- B. Train PyTorch Multi-Task Net ---
+        self.q_nd = 0.0
+        self.q_w = 0.0
+        
         if TORCH_AVAILABLE:
             train_ds = TensorDataset(
                 torch.tensor(X_train),
@@ -474,7 +666,7 @@ class SynthesisPredictiveEngine:
             self.nn_model = model
             model.eval()
             
-            # Neural Net metrics check
+            # Neural Net metrics check & Conformal Calibration
             with torch.no_grad():
                 X_val_t = torch.tensor(X_val)
                 nn_reg, nn_cls = model(X_val_t)
@@ -486,6 +678,15 @@ class SynthesisPredictiveEngine:
                 
                 self.val_mse = min(self.val_mse, nn_mse)
                 self.val_accuracy = max(self.val_accuracy, nn_acc)
+                
+                # Conformalized Quantile Regression calibration (95% coverage)
+                # Calculates how much validation target values exceeded the predicted 10th/90th quantile bounds
+                err_nd = np.maximum(nn_reg[:, 1] - y_reg_val[:, 1], y_reg_val[:, 0] - nn_reg[:, 0])
+                err_w = np.maximum(nn_reg[:, 3] - y_reg_val[:, 3], y_reg_val[:, 2] - nn_reg[:, 2])
+                
+                alpha = 0.05
+                self.q_nd = float(np.percentile(err_nd, (1.0 - alpha) * 100))
+                self.q_w = float(np.percentile(err_w, (1.0 - alpha) * 100))
                 
         self.is_trained = True
         return {
@@ -500,6 +701,7 @@ class SynthesisPredictiveEngine:
         Runs predictions on the very latest data row to project
         intraday range and weekly trend. Scales the predicted Z-Scores back 
         to price levels using the latest GARCH daily volatility.
+        Calibrates outputs using Conformal Prediction (CQR) and predicts HMM regime state.
         """
         if not self.is_trained:
             raise RuntimeError("Engine must be trained before predicting.")
@@ -507,10 +709,29 @@ class SynthesisPredictiveEngine:
         # 1. Compile today's feature row
         X_all = extract_synthesis_features(
             self.data, self.metrics, self.cot_df, 
-            self.daily_cvd, self.daily_div_signals, self.pivot_df
+            self.daily_cvd, self.daily_div_signals, self.pivot_df,
+            lstm_series=self.lstm_series, event_df=self.event_df
         )
         latest_row = X_all.iloc[[-1]].values
-        latest_row_scaled = self.scaler.transform(latest_row).astype(np.float32)
+        
+        # Predict HMM probabilities for latest row
+        latest_hmm_feat = latest_row[:, [2, 3]]
+        latest_hmm_probs = self.hmm.predict_state_probs(latest_hmm_feat)[0]
+        
+        # Extend latest row with HMM state probabilities and scale
+        latest_row_extended = np.hstack([latest_row, latest_hmm_probs.reshape(1, -1)])
+        latest_row_scaled = self.scaler.transform(latest_row_extended).astype(np.float32)
+        
+        # Classify HMM regime based on volatility sorting
+        vol_means = self.hmm.gmm.means_[:, 1]
+        sorted_states = np.argsort(vol_means)
+        state_map = {
+            sorted_states[0]: 'Low Volatility Rotational Grind',
+            sorted_states[1]: 'Neutral Range',
+            sorted_states[2]: 'High Volatility Distribution'
+        }
+        active_state_idx = int(np.argmax(latest_hmm_probs))
+        active_regime = state_map.get(active_state_idx, 'Neutral Range')
         
         close_latest = float(self.data['Close'].dropna().iloc[-1])
         daily_vol_latest = float(max(self.daily_vol.iloc[-1], 0.0001))
@@ -560,6 +781,18 @@ class SynthesisPredictiveEngine:
             'ml_model': _compile_prediction(rf_reg_pred, rf_clf_pred, rf_clf_probs),
             'nn_model': _compile_prediction(nn_reg_pred, nn_clf_pred, nn_cls_probs),
             'consensus': _compile_prediction(cons_reg_pred, cons_clf_pred, cons_cls_probs),
+            'conformal': {
+                'nd_high': close_latest * (1.0 + (nn_reg_pred[0] + self.q_nd) * daily_vol_latest),
+                'nd_low': close_latest * (1.0 + (nn_reg_pred[1] - self.q_nd) * daily_vol_latest),
+                'weekly_high': close_latest * (1.0 + (nn_reg_pred[2] + self.q_w) * daily_vol_latest),
+                'weekly_low': close_latest * (1.0 + (nn_reg_pred[3] - self.q_w) * daily_vol_latest),
+            },
+            'hmm_regime': active_regime,
+            'hmm_probs': {
+                'Rotational Grind': float(latest_hmm_probs[sorted_states[0]]),
+                'Neutral Range': float(latest_hmm_probs[sorted_states[1]]),
+                'Volatility Distribution': float(latest_hmm_probs[sorted_states[2]])
+            },
             'val_accuracy': self.val_accuracy,
             'val_mse': self.val_mse
         }
@@ -576,7 +809,9 @@ def get_trained_predictive_engine(
     _daily_cvd: pd.Series,
     _daily_div_signals: pd.Series,
     _pivot_df: pd.DataFrame,
-    predict_epochs: int
+    predict_epochs: int,
+    _lstm_series: pd.Series = None,
+    _event_df: pd.DataFrame = None
 ) -> SynthesisPredictiveEngine:
     """
     Initializes and trains the synthesis predictive engine resource, caching it in global RAM.
@@ -588,7 +823,9 @@ def get_trained_predictive_engine(
         cot_df=_cot_df,
         daily_cvd=_daily_cvd,
         daily_div_signals=_daily_div_signals,
-        pivot_df=_pivot_df
+        pivot_df=_pivot_df,
+        lstm_series=_lstm_series,
+        event_df=_event_df
     )
     engine.train(epochs=predict_epochs)
     return engine
