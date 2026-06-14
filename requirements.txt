@@ -18,3 +18,8 @@ torch>=2.1.0         # CPU build is fine; no CUDA required
 # Dashboard & Visualization
 streamlit>=1.30.0
 plotly>=5.18.0
+
+# Database Integration
+supabase>=2.3.0
+python-dotenv>=1.0.0
+

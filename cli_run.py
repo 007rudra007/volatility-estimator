@@ -14,6 +14,10 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 import warnings
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Force UTF-8 encoding for standard output on Windows
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -463,6 +467,27 @@ def run_pipeline(tickers: list, start: str, end: str) -> pd.DataFrame:
                 row['MC P(Up 20d)'] = 'err'
 
             rows.append(row)
+            
+            # Sync to Supabase
+            try:
+                from supabase_db import SUPABASE_ENABLED, save_volatility_analysis
+                if SUPABASE_ENABLED:
+                    print("   Syncing volatility analysis to Supabase...")
+                    full_data = raw.copy()
+                    for col in met.columns:
+                        full_data[col] = met[col].values
+                    full_data['Donchian_Upper'] = donchian['Donchian_Upper'].values
+                    full_data['Donchian_Lower'] = donchian['Donchian_Lower'].values
+                    full_data['Donchian_Middle'] = donchian['Donchian_Middle'].values
+                    full_data['Volume_SMA'] = volume_met['Volume_SMA'].values
+                    full_data['RVOL'] = volume_met['RVOL'].values
+                    full_data['Percentile'] = rs.get('percentile')
+                    full_data['Regime'] = reg
+                    
+                    save_volatility_analysis(sym, full_data)
+            except Exception as se:
+                print(f"      ! Supabase sync failed: {se}")
+
             print("   -> Completed successfully")
 
         except Exception as e:
