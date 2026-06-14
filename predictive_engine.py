@@ -32,11 +32,29 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.metrics import mean_squared_error, accuracy_score
 
+# Streamlit caching support
+try:
+    import streamlit as st
+    HAS_STREAMLIT = True
+except ImportError:
+    HAS_STREAMLIT = False
+
+def cache_data_decorator(*args, **kwargs):
+    if HAS_STREAMLIT:
+        return st.cache_data(*args, **kwargs)
+    return lambda f: f
+
+def cache_resource_decorator(*args, **kwargs):
+    if HAS_STREAMLIT:
+        return st.cache_resource(*args, **kwargs)
+    return lambda f: f
+
 
 # ==============================================================================
 # 1. Feature Synthesis
 # ==============================================================================
 
+@cache_data_decorator(ttl=900)
 def extract_synthesis_features(
     data: pd.DataFrame, 
     metrics: pd.DataFrame, 
@@ -328,11 +346,27 @@ class SynthesisPredictiveEngine:
         self.val_mse = 0.0
         self.train_loss_history = []
         
-        # Establish daily GARCH volatility series
-        vol_series = self.metrics['Vol_20d'] if 'Vol_20d' in self.metrics.columns else (
-            self.metrics['Vol_20'] if 'Vol_20' in self.metrics.columns else self.metrics['EWMA']
-        )
-        self.daily_vol = (vol_series / np.sqrt(252)).ffill().bfill().fillna(0.02)
+        # Establish active daily GARCH volatility series
+        garch_fitted = False
+        if 'Log_Ret' in self.metrics.columns or 'Close' in self.data.columns:
+            try:
+                from arch import arch_model
+                returns = self.metrics['Log_Ret'] if 'Log_Ret' in self.metrics.columns else np.log(self.data['Close'] / self.data['Close'].shift(1)).dropna()
+                clean_returns = returns.dropna() * 100  # Scale returns to percentage units for stability
+                model = arch_model(clean_returns, vol='Garch', p=1, q=1)
+                result = model.fit(disp='off')
+                # Convert conditional volatility back to daily decimal units (from % units)
+                garch_vol = pd.Series(result.conditional_volatility / 100, index=clean_returns.index)
+                self.daily_vol = garch_vol.reindex(self.data.index).ffill().bfill().fillna(0.02)
+                garch_fitted = True
+            except Exception as e:
+                pass
+        
+        if not garch_fitted:
+            vol_series = self.metrics['Vol_20d'] if 'Vol_20d' in self.metrics.columns else (
+                self.metrics['Vol_20'] if 'Vol_20' in self.metrics.columns else self.metrics['EWMA']
+            )
+            self.daily_vol = (vol_series / np.sqrt(252)).ffill().bfill().fillna(0.02)
         
     def _prepare_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Runs the extraction pipeline, aligns, and drop NaNs."""
@@ -529,3 +563,33 @@ class SynthesisPredictiveEngine:
             'val_accuracy': self.val_accuracy,
             'val_mse': self.val_mse
         }
+
+
+@cache_resource_decorator(ttl=900)
+def get_trained_predictive_engine(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    _data: pd.DataFrame,
+    _metrics: pd.DataFrame,
+    _cot_df: pd.DataFrame,
+    _daily_cvd: pd.Series,
+    _daily_div_signals: pd.Series,
+    _pivot_df: pd.DataFrame,
+    predict_epochs: int
+) -> SynthesisPredictiveEngine:
+    """
+    Initializes and trains the synthesis predictive engine resource, caching it in global RAM.
+    Avoids hashing large pandas structures by prefixing them with an underscore.
+    """
+    engine = SynthesisPredictiveEngine(
+        data=_data,
+        metrics=_metrics,
+        cot_df=_cot_df,
+        daily_cvd=_daily_cvd,
+        daily_div_signals=_daily_div_signals,
+        pivot_df=_pivot_df
+    )
+    engine.train(epochs=predict_epochs)
+    return engine
+

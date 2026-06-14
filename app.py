@@ -541,32 +541,35 @@ def fetch_intraday_hl(ticker: str) -> dict:
     except Exception as e:
         return None
 
-@st.cache_data(ttl=900)  # Cache model projections for 15 minutes to maximize app speed
 def run_cached_prediction_pipeline(
     ticker: str,
+    start_date: str,
+    end_date: str,
     data: pd.DataFrame,
     metrics: pd.DataFrame,
     cot_df: pd.DataFrame,
     daily_cvd: pd.Series,
     daily_div_signals: pd.Series,
     pivot_df: pd.DataFrame,
-    show_wave_fib: bool,
     predict_epochs: int
 ) -> dict:
-    """Trains synthesis predictor models once and caches inference outputs in memory."""
+    """Trains/retrieves synthesis predictor models cached in global RAM and runs inference."""
     import predictive_engine
     
-    pred_engine = predictive_engine.SynthesisPredictiveEngine(
-        data=data,
-        metrics=metrics,
-        cot_df=cot_df,
-        daily_cvd=daily_cvd,
-        daily_div_signals=daily_div_signals,
-        pivot_df=pivot_df if (show_wave_fib and pivot_df is not None) else None
+    # Use the cache_resource function from predictive_engine
+    pred_engine = predictive_engine.get_trained_predictive_engine(
+        ticker=ticker,
+        start_date=start_date,
+        end_date=end_date,
+        _data=data,
+        _metrics=metrics,
+        _cot_df=cot_df,
+        _daily_cvd=daily_cvd,
+        _daily_div_signals=daily_div_signals,
+        _pivot_df=pivot_df,
+        predict_epochs=predict_epochs
     )
     
-    # Train the models (no progress bar inside cached data call to prevent Streamlit widget serialization issues)
-    pred_engine.train(epochs=predict_epochs)
     return pred_engine.predict_latest()
 
 def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame, current_price: float = None) -> dict:
@@ -775,43 +778,46 @@ if analyze_clicked or 'data_loaded' in st.session_state:
 
         hl = fetch_intraday_hl(ticker)
         
-        # Wave Theory & Fibonacci Calculations
+        # Wave Theory & Fibonacci Calculations (always run calculations for model features, but display/render conditionally)
         if show_wave_fib:
             # 1. Dynamic or manual deviation
             if auto_wave_dev:
                 deviation_pct = wave_theory.get_dynamic_deviation(data, metrics)
             else:
                 deviation_pct = wave_dev_pct
-                
-            # 2. Run ZigZag
-            pivot_df = wave_theory.calculate_zigzag(data, deviation_pct=deviation_pct)
+        else:
+            deviation_pct = wave_theory.get_dynamic_deviation(data, metrics)
             
-            # 3. Label Waves
-            pivot_df = wave_theory.label_elliott_waves(pivot_df)
-            
-            # 4. Get active swing Fibonacci retracements
-            current_p = hl['close'] if hl else float(data['Close'].iloc[-1])
-            fib_levels, swing_dates = wave_theory.calculate_active_swing_fibs(pivot_df, current_p)
-            
-            # 5. Get volatility Fibonacci levels
-            vol_fibs = wave_theory.calculate_fib_vol_retracement(metrics[vol_col])
-            
-            # 6. Get Fibonacci Volatility Bands
-            fib_bands = wave_theory.calculate_fib_vol_bands(data['Close'], metrics[vol_col], window=20)
-            
+        # 2. Run ZigZag
+        pivot_df = wave_theory.calculate_zigzag(data, deviation_pct=deviation_pct)
+        
+        # 3. Label Waves
+        pivot_df = wave_theory.label_elliott_waves(pivot_df)
+        
+        # 4. Get active swing Fibonacci retracements
+        current_p = hl['close'] if hl else float(data['Close'].iloc[-1])
+        fib_levels, swing_dates = wave_theory.calculate_active_swing_fibs(pivot_df, current_p)
+        
+        # 5. Get volatility Fibonacci levels
+        vol_fibs = wave_theory.calculate_fib_vol_retracement(metrics[vol_col])
+        
+        # 6. Get Fibonacci Volatility Bands
+        fib_bands = wave_theory.calculate_fib_vol_bands(data['Close'], metrics[vol_col], window=20)
+        
         # AI Predictive Synthesis Calculations (using cached data pipeline)
         if show_predictor:
             with st.spinner("Training ML baseline & Deep Learning Neural Network..."):
                 try:
                     predictions_dict = run_cached_prediction_pipeline(
                         ticker=ticker,
+                        start_date=str(start_date),
+                        end_date=str(end_date),
                         data=data,
                         metrics=metrics,
                         cot_df=cot_df,
                         daily_cvd=daily_cvd,
                         daily_div_signals=daily_div_signals,
-                        pivot_df=pivot_df if (show_wave_fib and 'pivot_df' in locals()) else None,
-                        show_wave_fib=show_wave_fib,
+                        pivot_df=pivot_df,
                         predict_epochs=predict_epochs
                     )
                     st.session_state['_predictions_dict_cache'] = predictions_dict
