@@ -462,6 +462,31 @@ if show_predictor:
 else:
     predict_epochs = 40
 
+show_intraday_predictor = st.sidebar.checkbox(
+    "Enable Intraday 15m Predictor",
+    value=True,
+    help="Trains RF & PyTorch MLP to predict the 15-minute price path of the next trading day"
+)
+if show_intraday_predictor:
+    intraday_lookback = st.sidebar.slider(
+        "Intraday Training History (days)",
+        15, 60, 45, 5,
+        help="Number of trading days of 15m data to train the models on"
+    )
+    intraday_epochs = st.sidebar.slider(
+        "Intraday Training Epochs (AI)",
+        10, 100, 40, 5,
+        help="Number of training iterations for the Intraday Neural Network."
+    )
+    force_adapt = st.sidebar.button("Adapt & Retrain Intraday Models Now")
+    if force_adapt:
+        st.cache_resource.clear()
+        st.sidebar.success("Cache cleared! Retraining models...")
+else:
+    intraday_lookback = 45
+    intraday_epochs = 40
+    force_adapt = False
+
 # New SMA Volatility & Donchian / Volume Options
 st.sidebar.markdown("### 📊 SMA & Donchian Options")
 sma_window = st.sidebar.slider(
@@ -642,6 +667,38 @@ def run_cached_prediction_pipeline(
     )
     
     return pred_engine.predict_latest()
+
+def run_cached_intraday_prediction_pipeline(
+    ticker: str,
+    data: pd.DataFrame,
+    metrics: pd.DataFrame,
+    cot_df: pd.DataFrame,
+    daily_cvd: pd.Series,
+    daily_div_signals: pd.Series,
+    pivot_df: pd.DataFrame,
+    epochs: int,
+    lookback_days: int = 45,
+    lstm_series: pd.Series = None,
+    event_df: pd.DataFrame = None
+) -> tuple:
+    """Trains/retrieves next-day 15m price path models cached in global RAM and runs inference."""
+    import intraday_predictive_engine
+    
+    engine = intraday_predictive_engine.get_trained_intraday_engine(
+        ticker=ticker,
+        _daily_data=data,
+        _daily_metrics=metrics,
+        _daily_cot=cot_df,
+        _daily_cvd=daily_cvd,
+        _daily_div_signals=daily_div_signals,
+        _daily_pivots=pivot_df,
+        _daily_events=event_df,
+        _lstm_series=lstm_series,
+        epochs=epochs,
+        lookback_days=lookback_days
+    )
+    
+    return engine.predict_next_day(), engine
 
 def calculate_price_targets(data: pd.DataFrame, metrics: pd.DataFrame, current_price: float = None) -> dict:
     """
@@ -917,6 +974,38 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         else:
             st.session_state['_predictions_dict_cache'] = None
             
+        # Intraday 15-Minute price path predictor
+        if show_intraday_predictor:
+            with st.spinner("Training Intraday ML baseline & Deep Learning MLP..."):
+                try:
+                    lstm_series_val = None
+                    lstm_cached = st.session_state.get('_lstm_result_cache')
+                    if lstm_cached and 'in_sample_sigma' in lstm_cached:
+                        lstm_series_val = lstm_cached['in_sample_sigma']
+                        
+                    intraday_preds, intraday_engine = run_cached_intraday_prediction_pipeline(
+                        ticker=ticker,
+                        data=data,
+                        metrics=metrics,
+                        cot_df=cot_df,
+                        daily_cvd=daily_cvd,
+                        daily_div_signals=daily_div_signals,
+                        pivot_df=pivot_df,
+                        epochs=intraday_epochs,
+                        lookback_days=intraday_lookback,
+                        lstm_series=lstm_series_val,
+                        event_df=events_df if 'events_df' in locals() else None
+                    )
+                    st.session_state['_intraday_preds_cache'] = intraday_preds
+                    st.session_state['_intraday_engine_cache'] = intraday_engine
+                except Exception as e:
+                    st.error(f"Intraday Predictive Engine training failed: {e}")
+                    st.session_state['_intraday_preds_cache'] = None
+                    st.session_state['_intraday_engine_cache'] = None
+        else:
+            st.session_state['_intraday_preds_cache'] = None
+            st.session_state['_intraday_engine_cache'] = None
+            
         if hl:
             hl_c1, hl_c2, hl_c3, hl_c4, hl_c5 = st.columns(5)
             chg_str  = f"{hl['chg_pct']:+.2f}%" if hl['chg_pct'] is not None else "N/A"
@@ -990,6 +1079,10 @@ if analyze_clicked or 'data_loaded' in st.session_state:
         st.markdown("---")
         st.markdown("## 🛡️ Trade Confirmations (GEX, COT, CVD)")
         tab_conf = st.container()
+        
+        st.markdown("---")
+        st.markdown("## 📈 Quant Backtest Analysis Workspace")
+        tab_backtest = st.container()
 
         with tab_vol:
             # 🌊 Wave & Fibonacci Projections Summary Card
@@ -1163,6 +1256,179 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                         unsafe_allow_html=True
                     )
                 
+                st.divider()
+
+            # 🧠 AI Intraday Price Path Projections
+            if show_intraday_predictor and st.session_state.get('_intraday_preds_cache') is not None:
+                intra_preds = st.session_state.get('_intraday_preds_cache')
+                intra_engine = st.session_state.get('_intraday_engine_cache')
+                
+                st.markdown("### 📈 Intraday Price Path Forecast (15m Interval)")
+                st.caption("Machine Learning next-day price path predictions at 15-minute intervals (9:15 to 3:30).")
+                
+                # Plotly Chart
+                df_preds = pd.DataFrame(intra_preds)
+                
+                # Fetch today's actual 15m prices for overlay
+                try:
+                    today_intra = yf.download(ticker, period="1d", interval="15m", progress=False)
+                    if isinstance(today_intra.columns, pd.MultiIndex):
+                        today_intra.columns = today_intra.columns.get_level_values(0)
+                    today_intra.index = today_intra.index.tz_localize(None)
+                    today_intra['Time'] = today_intra.index.strftime('%H:%M')
+                    today_prices = today_intra.groupby('Time')['Close'].last()
+                except Exception:
+                    today_prices = pd.Series()
+                    
+                fig_path = go.Figure()
+                
+                # Shaded confidence band (upper to lower)
+                fig_path.add_trace(go.Scatter(
+                    x=df_preds['time'],
+                    y=df_preds['high_bound'],
+                    mode='lines',
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo='skip'
+                ))
+                fig_path.add_trace(go.Scatter(
+                    x=df_preds['time'],
+                    y=df_preds['low_bound'],
+                    mode='lines',
+                    line=dict(width=0),
+                    fill='tonexty',
+                    fillcolor='rgba(37, 99, 235, 0.12)', # light blue tint
+                    name='90% Confidence Band',
+                    hoverinfo='skip'
+                ))
+                
+                # Prediction Mean Line
+                fig_path.add_trace(go.Scatter(
+                    x=df_preds['time'],
+                    y=df_preds['pred_price'],
+                    mode='lines+markers',
+                    line=dict(color='#2563EB', width=2),
+                    marker=dict(size=4),
+                    name='Predicted Price (Tomorrow)',
+                    hovertemplate='Time: %{x}<br>Pred Price: ₹%{y:,.2f}<extra></extra>'
+                ))
+                
+                # Today's Actual Price path overlay if available
+                if not today_prices.empty:
+                    # Align with standard times
+                    today_prices_aligned = today_prices.reindex(df_preds['time'])
+                    fig_path.add_trace(go.Scatter(
+                        x=today_prices_aligned.index,
+                        y=today_prices_aligned.values,
+                        mode='lines+markers',
+                        line=dict(color='#374151', width=1.8, dash='dash'),
+                        marker=dict(size=4),
+                        name='Actual Price (Today)',
+                        hovertemplate='Time: %{x}<br>Actual Price: ₹%{y:,.2f}<extra></extra>'
+                    ))
+                    
+                fig_path.update_layout(
+                    height=380,
+                    paper_bgcolor=QUANT_COLORS['bg'],
+                    plot_bgcolor=QUANT_COLORS['panel'],
+                    font=dict(color=QUANT_COLORS['text'], family='IBM Plex Sans'),
+                    margin=dict(l=50, r=30, t=30, b=40),
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                    xaxis=dict(gridcolor='#E5E7EB', title='Trading Time'),
+                    yaxis=dict(gridcolor='#E5E7EB', title='Price (₹)', tickformat=',.2f')
+                )
+                
+                st.plotly_chart(fig_path, use_container_width=True)
+                
+                # Interactive Dropdown Selector
+                st.markdown("#### 🔍 Next-Day Candle-by-Candle Price Lookup")
+                selected_time = st.select_slider(
+                    "Drag to view expected close price and ranges at any specific 15-minute candle:",
+                    options=df_preds['time'].tolist()
+                )
+                
+                if selected_time:
+                    row = df_preds[df_preds['time'] == selected_time].iloc[0]
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric(
+                            label=f"Expected Price at {selected_time}",
+                            value=f"₹{row['pred_price']:,.2f}"
+                        )
+                    with c2:
+                        st.metric(
+                            label="Predicted Range",
+                            value=f"₹{row['low_bound']:,.2f} - ₹{row['high_bound']:,.2f}"
+                        )
+                    with c3:
+                        st.metric(
+                            label="Change vs today's close",
+                            value=f"{row['pct_change']:+.2f}%"
+                        )
+                    with c4:
+                        prob = row['prob_up']
+                        if prob >= 0.5:
+                            st.metric(
+                                label="Directional Odds",
+                                value=f"{prob*100:.0f}% Prob. Up",
+                                delta="Bullish Bias"
+                            )
+                        else:
+                            st.metric(
+                                label="Directional Odds",
+                                value=f"{(1.0-prob)*100:.0f}% Prob. Down",
+                                delta="-Bearish Bias",
+                                delta_color="inverse"
+                            )
+                            
+                # Dynamic Learning Feedback status card
+                if intraday_engine:
+                    try:
+                        is_drifted, rmse = intraday_engine.check_concept_drift()
+                        n_samples = intraday_engine.aligned_features_df.shape[0]
+                        
+                        if is_drifted:
+                            status_html = f"""
+                            <div style="border-left: 4px solid #EF4444; padding: 12px 18px; background: #FEF2F2; border-radius: 0 8px 8px 0; margin-top: 12px; margin-bottom: 12px;">
+                                <div style="font-size: 11px; font-weight: 700; color: #EF4444; text-transform: uppercase; margin-bottom: 6px;">⚠️ Dynamic Learning: Concept Drift Detected</div>
+                                <div style="font-size: 12px; color: #7F1D1D; margin-top: 4px;">
+                                    Model prediction error (RMSE: <strong>{rmse:.2%}</strong>) exceeded the 1.50% threshold. 
+                                    <strong>Online Adaptation:</strong> The model weights have successfully self-corrected and adapted to the current market regime.
+                                </div>
+                                <div style="font-size: 11px; color: #991B1B; margin-top: 4px;">
+                                    Total historical alignment samples: <strong>{n_samples} trading days</strong> &middot; Features normalized: <strong>{intraday_engine.scaler.n_features_in_}</strong>
+                                </div>
+                            </div>
+                            """
+                        elif rmse > 0:
+                            status_html = f"""
+                            <div style="border-left: 4px solid #10B981; padding: 12px 18px; background: #ECFDF5; border-radius: 0 8px 8px 0; margin-top: 12px; margin-bottom: 12px;">
+                                <div style="font-size: 11px; font-weight: 700; color: #10B981; text-transform: uppercase; margin-bottom: 6px;">✓ Dynamic Learning: Calibration Stable</div>
+                                <div style="font-size: 12px; color: #065F46; margin-top: 4px;">
+                                    Model predictions are fully calibrated. Recent out-of-sample prediction error (RMSE): <strong>{rmse:.2%}</strong>.
+                                </div>
+                                <div style="font-size: 11px; color: #047857; margin-top: 4px;">
+                                    Total historical alignment samples: <strong>{n_samples} trading days</strong> &middot; Features normalized: <strong>{intraday_engine.scaler.n_features_in_}</strong>
+                                </div>
+                            </div>
+                            """
+                        else:
+                            status_html = f"""
+                            <div style="border-left: 4px solid #3B82F6; padding: 12px 18px; background: #EFF6FF; border-radius: 0 8px 8px 0; margin-top: 12px; margin-bottom: 12px;">
+                                <div style="font-size: 11px; font-weight: 700; color: #3B82F6; text-transform: uppercase; margin-bottom: 6px;">ℹ️ Dynamic Learning: Initializing ledger</div>
+                                <div style="font-size: 12px; color: #1E3A8A; margin-top: 4px;">
+                                    Ledger is tracking predictions. Out-of-sample RMSE will display once completed days are logged in the SQLite database.
+                                </div>
+                                <div style="font-size: 11px; color: #1D4ED8; margin-top: 4px;">
+                                    Total historical alignment samples: <strong>{n_samples} trading days</strong> &middot; Features normalized: <strong>{intraday_engine.scaler.n_features_in_}</strong>
+                                </div>
+                            </div>
+                            """
+                        st.markdown(status_html, unsafe_allow_html=True)
+                    except Exception:
+                        pass
+                        
                 st.divider()
 
             # GARCH(1,1) Forecast  (shown above charts for forward-looking context)
@@ -2734,6 +3000,194 @@ if analyze_clicked or 'data_loaded' in st.session_state:
                     yaxis=dict(gridcolor=QUANT_COLORS['grid'])
                 )
                 st.plotly_chart(fig_cot, use_container_width=True)
+
+        with tab_backtest:
+            st.markdown("## 📈 Quant Backtest Analysis Workspace")
+            st.caption("Walk-forward historical evaluation of volatility bands, CVD divergence signals, and combined quant strategy.")
+            
+            # Backtesting settings layout
+            bcol1, bcol2, bcol3, bcol4 = st.columns(4)
+            with bcol1:
+                backtest_years = st.slider("Backtest History Lookback (years)", 0.5, 3.0, 1.0, 0.5, help="Number of historical years to run the backtest on.")
+            with bcol2:
+                stop_loss_val = st.slider("Stop Loss Limit (%)", 1.0, 10.0, 3.0, 0.5, help="Stop loss trigger percentage for simulated trades.")
+            with bcol3:
+                take_profit_val = st.slider("Take Profit Limit (%)", 2.0, 20.0, 6.0, 0.5, help="Take profit target percentage for simulated trades.")
+            with bcol4:
+                retrain_freq_val = st.slider("Retraining Frequency (days)", 10, 50, 20, 5, help="How often EOD predictive AI models are retrained in walk-forward simulation.")
+                
+            run_ai_wf = st.checkbox("Include walk-forward EOD AI Predictions", value=True, help="Enables walk-forward EOD training for strategy filters (warning: increases execution time).")
+            
+            run_backtest_btn = st.button("Run Historical Backtest Simulation", type="primary", use_container_width=True)
+            
+            if run_backtest_btn:
+                import backtest_engine
+                
+                # Check target dates and filter
+                end_bt = data.index[-1]
+                start_bt = end_bt - timedelta(days=int(backtest_years * 365.25))
+                
+                # Align start date to maximum available historical range
+                if start_bt < data.index[0]:
+                    start_bt = data.index[0]
+                    st.info(f"ℹ️ History limited. Running backtest on maximum available data starting from {start_bt.strftime('%d-%b-%Y')}.")
+                    
+                # Slice data
+                bt_data = data[data.index >= start_bt].copy()
+                bt_metrics = metrics[metrics.index >= start_bt].copy()
+                bt_cot = cot_df[cot_df.index >= start_bt].copy() if cot_df is not None else None
+                bt_cvd = daily_cvd[daily_cvd.index >= start_bt].copy()
+                bt_div = daily_div_signals[daily_div_signals.index >= start_bt].copy()
+                bt_pivots = pivot_df[pivot_df.index >= start_bt].copy() if pivot_df is not None and not pivot_df.empty else pd.DataFrame()
+                
+                n_bt = len(bt_data)
+                
+                if n_bt < 40:
+                    st.error("❌ Not enough data in lookback period to run backtest. Please select a longer lookback or fetch more history.")
+                else:
+                    # Execute backtest
+                    with st.spinner("Executing walk-forward quant backtest..."):
+                        try:
+                            # 1. Volatility Band Breach Analysis
+                            vol_col_bt = next((c for c in ['Vol_20d', 'Vol_20', 'EWMA'] if c in bt_metrics.columns), 'EWMA')
+                            res_vol = backtest_engine.validate_volatility_bands(
+                                close_prices=bt_data['Close'],
+                                high_prices=bt_data['High'],
+                                low_prices=bt_data['Low'],
+                                vol_series=bt_metrics[vol_col_bt],
+                                multiplier=1.5
+                            )
+                            
+                            # 2. CVD Divergence Stats
+                            res_cvd = backtest_engine.analyze_cvd_divergences(
+                                prices=bt_data['Close'],
+                                cvd_signals=bt_div,
+                                horizons=[1, 3, 5, 10]
+                            )
+                            
+                            # 3. Quantitative Trading Strategy Simulation
+                            # Retrain AI models only if enabled and we have enough EOD data
+                            run_ai_in_bt = run_ai_wf and (n_bt > 50)
+                            
+                            res_strat = backtest_engine.run_strategy_backtest(
+                                data=bt_data,
+                                metrics=bt_metrics,
+                                cot_df=bt_cot,
+                                daily_cvd=bt_cvd,
+                                daily_div_signals=bt_div,
+                                pivot_df=bt_pivots,
+                                run_ai_predictions=run_ai_in_bt,
+                                stop_loss_pct=stop_loss_val,
+                                take_profit_pct=take_profit_val,
+                                initial_train_days=35,
+                                retrain_freq=retrain_freq_val
+                            )
+                            
+                            # Render UI results
+                            st.success("✓ Backtest simulation complete!")
+                            
+                            # --- Metrics Grid ---
+                            st.markdown("### 📊 Strategy Performance Summary")
+                            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                            with mc1:
+                                st.metric("Strategy Return", f"{res_strat['cumulative_return']:.1%}", 
+                                          delta=f"{res_strat['cumulative_return'] - res_strat['benchmark_return']:+.1%} vs Asset")
+                            with mc2:
+                                st.metric("Asset Return", f"{res_strat['benchmark_return']:.1%}")
+                            with mc3:
+                                st.metric("Sharpe Ratio", f"{res_strat['sharpe_ratio']:.2f}")
+                            with mc4:
+                                st.metric("Max Drawdown", f"{res_strat['max_drawdown']:.1%}")
+                            with mc5:
+                                st.metric("Trades Executed", len(res_strat['trades']))
+                                
+                            # --- Equity Curve Plotly Chart (Subplots: Equity + Drawdown) ---
+                            fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                                   vertical_spacing=0.08, row_heights=[0.7, 0.3])
+                            
+                            # Cumulative Return lines
+                            fig_bt.add_trace(go.Scatter(
+                                x=res_strat['equity_curve'].index,
+                                y=(res_strat['equity_curve'] - 1.0) * 100.0,
+                                name='Strategy Equity Curve',
+                                line=dict(color='#2563EB', width=2),
+                                fill='tozeroy',
+                                fillcolor='rgba(37, 99, 235, 0.05)'
+                            ), row=1, col=1)
+                            
+                            bench_curve = bt_data['Close'] / bt_data['Close'].iloc[35] - 1.0 # align starting index
+                            fig_bt.add_trace(go.Scatter(
+                                x=bench_curve.index[35:],
+                                y=bench_curve.values[35:] * 100.0,
+                                name='Asset Buy & Hold',
+                                line=dict(color='#6B7280', width=1.5, dash='dash')
+                            ), row=1, col=1)
+                            
+                            # Drawdown area
+                            fig_bt.add_trace(go.Scatter(
+                                x=res_strat['drawdowns'].index,
+                                y=res_strat['drawdowns'].values * 100.0,
+                                name='Strategy Drawdown',
+                                line=dict(color='#DC2626', width=1.2),
+                                fill='tozeroy',
+                                fillcolor='rgba(220, 38, 38, 0.1)'
+                            ), row=2, col=1)
+                            
+                            fig_bt.update_layout(
+                                height=450,
+                                paper_bgcolor=QUANT_COLORS['bg'],
+                                plot_bgcolor=QUANT_COLORS['panel'],
+                                font=dict(color=QUANT_COLORS['text'], family='IBM Plex Sans'),
+                                margin=dict(l=50, r=30, t=20, b=40),
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                            )
+                            fig_bt.update_xaxes(gridcolor=QUANT_COLORS['grid'], row=1, col=1)
+                            fig_bt.update_xaxes(gridcolor=QUANT_COLORS['grid'], row=2, col=1)
+                            fig_bt.update_yaxes(title_text="Equity Return (%)", gridcolor=QUANT_COLORS['grid'], row=1, col=1)
+                            fig_bt.update_yaxes(title_text="Drawdown (%)", gridcolor=QUANT_COLORS['grid'], row=2, col=1)
+                            
+                            st.plotly_chart(fig_bt, use_container_width=True)
+                            
+                            # --- Statistical validation metrics ---
+                            st.divider()
+                            st.markdown("### 🎯 Technical Indicator Edge Analysis")
+                            
+                            scol1, scol2 = st.columns(2)
+                            with scol1:
+                                st.markdown("**Volatility Band Breach Summary**")
+                                st.write(f"Price stayed within Volatility Bands **{res_vol['hit_rate']:.1%}** of the time (Lookback: {res_vol['total_days']} days).")
+                                st.write(f"Total breaches: **{res_vol['total_breaches']}** (Upper: {len([b for b in res_vol['breaches'] if 'Upper' in b['Type']])}, Lower: {len([b for b in res_vol['breaches'] if 'Lower' in b['Type']])}).")
+                                if res_vol['breaches']:
+                                    st.dataframe(pd.DataFrame(res_vol['breaches']).head(5), use_container_width=True)
+                                    
+                            with scol2:
+                                st.markdown("**CVD Divergence Forward Performance**")
+                                fwd_rows = []
+                                for h in ['1d', '3d', '5d', '10d']:
+                                    bull_h = res_cvd['bullish'].get(h, {'mean_return': 0.0, 'win_rate': 0.0, 'count': 0})
+                                    bear_h = res_cvd['bearish'].get(h, {'mean_return': 0.0, 'win_rate': 0.0, 'count': 0})
+                                    fwd_rows.append({
+                                        'Horizon': h,
+                                        'Bullish Count': bull_h['count'],
+                                        'Bullish Return': f"{bull_h['mean_return']:+.2%}",
+                                        'Bullish Win Rate': f"{bull_h['win_rate']:.1%}",
+                                        'Bearish Count': bear_h['count'],
+                                        'Bearish Return': f"{bear_h['mean_return']:+.2%}",
+                                        'Bearish Win Rate': f"{bear_h['win_rate']:.1%}"
+                                    })
+                                st.dataframe(pd.DataFrame(fwd_rows).set_index('Horizon'), use_container_width=True)
+                                
+                            # --- Trade logs ---
+                            st.divider()
+                            st.markdown("### 📜 Executed Strategy Trade Log")
+                            if res_strat['trades']:
+                                st.write(f"Strategy Win Rate: **{res_strat['win_rate']:.1%}** | Total Trades: **{len(res_strat['trades'])}**")
+                                st.dataframe(pd.DataFrame(res_strat['trades']).sort_index(ascending=False), use_container_width=True)
+                            else:
+                                st.info("No trades executed by the strategy during the backtest period.")
+                                
+                        except Exception as bte:
+                            st.error(f"Backtest execution failed: {bte}")
 
         # --- Save results to Supabase ---
         try:

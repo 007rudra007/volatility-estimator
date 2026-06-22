@@ -47,10 +47,19 @@
             ⚠️ Supabase connection not configured. Tap the ⚙️ icon to set up keys.
         </div>
 
+        <!-- Tabs Navigation -->
+        <div id="tabs-navigation" class="tabs-nav hidden">
+            <button class="tab-btn active" data-tab="tab-cockpit">📊 Risk Cockpit</button>
+            <button class="tab-btn" data-tab="tab-predictor">🔮 Price Predictor</button>
+            <button class="tab-btn" data-tab="tab-backtest">📈 Backtest Workspace</button>
+        </div>
+
         <!-- Main Dashboard content (hidden until connected) -->
         <main id="dashboard-content" class="dashboard-grid hidden">
             
-            <!-- Summary Stats Cards Row -->
+            <!-- Tab 1: Risk Cockpit -->
+            <div id="tab-cockpit" class="tab-pane active-pane">
+                <!-- Summary Stats Cards Row -->
             <section class="stats-row">
                 <!-- Card 1: Current Regime -->
                 <div class="stat-card" id="card-regime">
@@ -138,7 +147,152 @@
                         </tbody>
                     </table>
                 </div>
-            </section>
+            </div> <!-- End Tab 1: Risk Cockpit -->
+
+            <!-- Tab 2: Next-Day 15m Price Predictor -->
+            <div id="tab-predictor" class="tab-pane hidden-pane">
+                <section class="chart-card">
+                    <div class="chart-header">
+                        <h2>Next-Day 15-Minute Price Path Forecast</h2>
+                        <span class="badge">Dynamic AI Predictor</span>
+                    </div>
+                    <div class="chart-container" id="chart-price-predictor"></div>
+                    
+                    <!-- Interactive Candle Selector Slider -->
+                    <div class="predictor-controls" style="margin-top: 20px; padding: 16px; background-color: var(--panel-header); border: 1px solid var(--border); border-radius: var(--radius-md);">
+                        <div class="slider-group">
+                            <label for="slider-candle">Select 15-Minute Candle Time</label>
+                            <input type="range" id="slider-candle" min="0" max="0" value="0" class="range-slider" style="width: 100%; margin: 12px 0;">
+                            <div class="slider-labels" style="display: flex; justify-content: space-between; font-size: 12px; font-family: var(--font-mono); color: var(--text-muted);">
+                                <span id="label-slider-start">09:15</span>
+                                <span id="label-slider-current" class="current-val" style="color: var(--primary); font-weight: 600;">09:15</span>
+                                <span id="label-slider-end">15:15</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Prediction Details Cards -->
+                <section class="stats-row" style="margin-top: 16px;">
+                    <div class="stat-card">
+                        <h3>Predicted Price</h3>
+                        <div class="value" id="pred-val-price">₹—</div>
+                        <div class="sub-label">Expected target</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Confidence Band</h3>
+                        <div class="value" id="pred-val-band" style="font-size: 15px; margin: 10px 0;">—</div>
+                        <div class="sub-label">10th to 90th percentile</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Expected Change</h3>
+                        <div class="value" id="pred-val-change">—</div>
+                        <div class="sub-label">vs last close</div>
+                    </div>
+                </section>
+            </div> <!-- End Tab 2 -->
+
+            <!-- Tab 3: Backtest Workspace -->
+            <div id="tab-backtest" class="tab-pane hidden-pane">
+                <!-- Summary & KPI Grid -->
+                <section class="table-card" style="margin-bottom: 16px;">
+                    <div class="table-header">
+                        <h2>Strategy Performance Summary</h2>
+                        <span class="badge">EOD Simulation</span>
+                    </div>
+                    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">
+                        Vectorized historical evaluation of realized volatility channels, CVD divergences, and cot net positions. Retrained EOD by daily quantitative pipeline.
+                    </p>
+                    
+                    <div class="stats-row">
+                        <div class="stat-card">
+                            <h3>Strategy Return</h3>
+                            <div class="value" id="bt-val-return">—</div>
+                            <div class="sub-label" id="bt-val-diff">— vs Benchmark</div>
+                        </div>
+                        <div class="stat-card">
+                            <h3>Benchmark Return</h3>
+                            <div class="value" id="bt-val-benchmark">—</div>
+                            <div class="sub-label">Asset Buy & Hold</div>
+                        </div>
+                        <div class="stat-card">
+                            <h3>Sharpe Ratio</h3>
+                            <div class="value" id="bt-val-sharpe">—</div>
+                            <div class="sub-label">Risk-Adjusted</div>
+                        </div>
+                        <div class="stat-card">
+                            <h3>Max Drawdown</h3>
+                            <div class="value" id="bt-val-drawdown">—</div>
+                            <div class="sub-label">Peak to Trough</div>
+                        </div>
+                        <div class="stat-card">
+                            <h3>Win Rate</h3>
+                            <div class="value" id="bt-val-winrate">—</div>
+                            <div class="sub-label" id="bt-val-trades">— trades</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Equity Curve Chart -->
+                <section class="chart-card" style="margin-bottom: 16px;">
+                    <div class="chart-header">
+                        <h2>Strategy Cumulative Return vs Benchmark Asset</h2>
+                        <span class="badge">Equity Curve</span>
+                    </div>
+                    <div class="chart-container" id="chart-backtest-equity"></div>
+                </section>
+
+                <!-- Double Table Row (Volatility breaches and CVD divergence performance) -->
+                <section class="table-card" style="margin-bottom: 16px;">
+                    <div class="table-header">
+                        <h2>CVD Divergence Forward Returns Performance</h2>
+                    </div>
+                    <div class="table-responsive">
+                        <table id="table-bt-cvd">
+                            <thead>
+                                <tr>
+                                    <th>Horizon</th>
+                                    <th>Bullish Avg Return</th>
+                                    <th>Bullish Win Rate</th>
+                                    <th>Bearish Avg Return</th>
+                                    <th>Bearish Win Rate</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td colspan="5" class="text-center">Loading backtest data...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- Strategy Trade Log Table -->
+                <section class="table-card">
+                    <div class="table-header">
+                        <h2>Simulated Strategy Trade Log</h2>
+                    </div>
+                    <div class="table-responsive" style="max-height: 250px; overflow-y: auto;">
+                        <table id="table-bt-trades">
+                            <thead>
+                                <tr>
+                                    <th>Entry Date</th>
+                                    <th>Type</th>
+                                    <th>Price</th>
+                                    <th>Exit Date</th>
+                                    <th>Exit Price</th>
+                                    <th>Return</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td colspan="6" class="text-center">Loading simulated trade list...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div> <!-- End Tab 3 -->
 
         </main>
         

@@ -470,7 +470,16 @@ def run_pipeline(tickers: list, start: str, end: str) -> pd.DataFrame:
             
             # Sync to Supabase
             try:
-                from supabase_db import SUPABASE_ENABLED, save_volatility_analysis
+                from supabase_db import (
+                    SUPABASE_ENABLED, 
+                    save_volatility_analysis,
+                    save_gex_key_levels,
+                    save_gex_profiles,
+                    save_positioning_data,
+                    save_cvd_data,
+                    save_intraday_predictions,
+                    save_backtest_results
+                )
                 if SUPABASE_ENABLED:
                     print("   Syncing volatility analysis to Supabase...")
                     full_data = raw.copy()
@@ -485,6 +494,128 @@ def run_pipeline(tickers: list, start: str, end: str) -> pd.DataFrame:
                     full_data['Regime'] = reg
                     
                     save_volatility_analysis(sym, full_data)
+
+                    # Compute and Save Confirmations
+                    import confirmations_engine as ce
+                    spot_price = float(raw['Close'].iloc[-1])
+                    ewma_v = float(met['EWMA'].dropna().iloc[-1]) if 'EWMA' in met.columns else 0.20
+                    
+                    print("   Syncing GEX profile & key levels to Supabase...")
+                    gex_df = ce.get_real_gex_profile(sym, spot_price, ewma_vol=ewma_v)
+                    if gex_df is None or gex_df.empty:
+                        gex_df = ce.get_synthetic_gex_profile(spot_price, ewma_vol=ewma_v)
+                    
+                    gex_levels = ce.extract_gex_key_levels(gex_df, spot_price)
+                    save_gex_profiles(sym, gex_df)
+                    save_gex_key_levels(sym, gex_levels, spot_price)
+
+                    print("   Syncing positioning and CVD order delta to Supabase...")
+                    cot_df = ce.get_cot_positioning(sym, raw['Close'])
+                    save_positioning_data(sym, cot_df)
+
+                    daily_cvd = ce.calculate_daily_cvd(raw)
+                    daily_div_signals = ce.detect_cvd_divergences(raw['Close'], daily_cvd)
+                    cvd_save_df = pd.DataFrame({
+                        'Close': raw['Close'],
+                        'Volume': raw['Volume'],
+                        'Delta': raw['Volume'] * 0.0,
+                        'CVD': daily_cvd
+                    })
+                    close_sign = np.sign(raw['Close'].diff().fillna(0))
+                    body_diff = raw['Close'] - raw.get('Open', raw['Close'])
+                    hl_range = raw.get('High', raw['Close']) - raw.get('Low', raw['Close'])
+                    vol_force = pd.Series(0.0, index=raw.index)
+                    mask = hl_range > 0
+                    vol_force[mask] = (body_diff[mask] / hl_range[mask]) * raw['Volume'][mask]
+                    cvd_save_df['Delta'] = 0.6 * vol_force + 0.4 * (close_sign * raw['Volume'])
+                    save_cvd_data(sym, cvd_save_df, daily_div_signals)
+
+                    # Compute and Save Elliott Wave Pivots
+                    import wave_theory
+                    deviation_pct = wave_theory.get_dynamic_deviation(raw, met)
+                    pivot_df = wave_theory.calculate_zigzag(raw, deviation_pct=deviation_pct)
+                    pivot_df = wave_theory.label_elliott_waves(pivot_df)
+
+                    # Run Next-Day Intraday Predictor
+                    print("   Syncing next-day 15m price path predictions to Supabase...")
+                    try:
+                        import intraday_predictive_engine as ipe
+                        engine = ipe.IntradayPredictiveEngine(
+                            ticker=sym,
+                            daily_data=raw,
+                            daily_metrics=met,
+                            daily_cot=cot_df,
+                            daily_cvd=daily_cvd,
+                            daily_div_signals=daily_div_signals,
+                            daily_pivots=pivot_df,
+                            lookback_days=45
+                        )
+                        engine.train(epochs=15)
+                        predictions = engine.predict_next_day()
+                        save_intraday_predictions(sym, predictions)
+                    except Exception as pe:
+                        print(f"      ! Intraday prediction failed for {sym}: {pe}")
+
+                    # Run Backtester
+                    print("   Syncing EOD strategy backtest results to Supabase...")
+                    try:
+                        import backtest_engine
+                        end_bt = raw.index[-1]
+                        start_bt = end_bt - timedelta(days=365)
+                        if start_bt < raw.index[0]:
+                            start_bt = raw.index[0]
+                        
+                        bt_data = raw[raw.index >= start_bt].copy()
+                        bt_metrics = met[met.index >= start_bt].copy()
+                        bt_cot = cot_df[cot_df.index >= start_bt].copy() if cot_df is not None else None
+                        bt_cvd = daily_cvd[daily_cvd.index >= start_bt].copy()
+                        bt_div = daily_div_signals[daily_div_signals.index >= start_bt].copy()
+                        bt_pivots = pivot_df[pivot_df.index >= start_bt].copy() if not pivot_df.empty else pd.DataFrame()
+
+                        vol_col_bt = next((c for c in ['Vol_20d', 'Vol_20', 'EWMA'] if c in bt_metrics.columns), 'EWMA')
+                        res_vol = backtest_engine.validate_volatility_bands(
+                            close_prices=bt_data['Close'],
+                            high_prices=bt_data['High'],
+                            low_prices=bt_data['Low'],
+                            vol_series=bt_metrics[vol_col_bt],
+                            multiplier=1.5
+                        )
+
+                        res_cvd = backtest_engine.analyze_cvd_divergences(
+                            prices=bt_data['Close'],
+                            cvd_signals=bt_div,
+                            horizons=[1, 3, 5, 10]
+                        )
+
+                        res_strat = backtest_engine.run_strategy_backtest(
+                            data=bt_data,
+                            metrics=bt_metrics,
+                            cot_df=bt_cot,
+                            daily_cvd=bt_cvd,
+                            daily_div_signals=bt_div,
+                            pivot_df=bt_pivots,
+                            run_ai_predictions=False,
+                            stop_loss_pct=3.0,
+                            take_profit_pct=6.0,
+                            initial_train_days=35,
+                            retrain_freq=20
+                        )
+
+                        backtest_results_payload = {
+                            'cumulative_return': res_strat['cumulative_return'],
+                            'benchmark_return': res_strat['benchmark_return'],
+                            'sharpe_ratio': res_strat['sharpe_ratio'],
+                            'max_drawdown': res_strat['max_drawdown'],
+                            'win_rate': res_strat['win_rate'],
+                            'trade_count': res_strat['trade_count'],
+                            'equity_curve': res_strat['equity_curve'],
+                            'trade_logs': res_strat['trade_logs'],
+                            'volatility_breaches': res_vol,
+                            'cvd_forward_returns': res_cvd
+                        }
+                        save_backtest_results(sym, backtest_results_payload)
+                    except Exception as be:
+                        print(f"      ! Backtester failed for {sym}: {be}")
             except Exception as se:
                 print(f"      ! Supabase sync failed: {se}")
 

@@ -134,6 +134,63 @@ def test_cvd_data():
         print("[-] Failed to insert mock CVD data.")
     return success
 
+def test_intraday_predictions():
+    print("\n8. Testing intraday_predictions insert...")
+    preds = [
+        {
+            'target_date': '2026-06-18',
+            'candle_time': '09:15',
+            'pred_price': 150.5,
+            'low_bound': 148.0,
+            'high_bound': 152.0,
+            'actual_price': None
+        },
+        {
+            'target_date': '2026-06-18',
+            'candle_time': '09:30',
+            'pred_price': 151.2,
+            'low_bound': 149.0,
+            'high_bound': 153.5,
+            'actual_price': None
+        }
+    ]
+    success = sdb.save_intraday_predictions("MOCK_STOCK", preds)
+    if success:
+        print("[+] Mock intraday predictions inserted successfully.")
+    else:
+        print("[-] Failed to insert mock intraday predictions.")
+    return success
+
+def test_backtest_results():
+    print("\n9. Testing backtest_results insert...")
+    results = {
+        'cumulative_return': 0.154,
+        'benchmark_return': 0.082,
+        'sharpe_ratio': 1.65,
+        'max_drawdown': -0.075,
+        'win_rate': 0.58,
+        'trade_count': 12,
+        'equity_curve': [
+            {'date': '2026-06-12', 'strategy_return': 0.0, 'benchmark_return': 0.0},
+            {'date': '2026-06-15', 'strategy_return': 0.025, 'benchmark_return': 0.012}
+        ],
+        'trade_logs': [
+            {'entry_date': '2026-06-12', 'entry_price': 145.2, 'exit_date': '2026-06-15', 'exit_price': 148.8, 'return': 0.025, 'type': 'Long'}
+        ],
+        'volatility_breaches': [
+            {'date': '2026-06-15', 'price': 151.3, 'bound': 'Upper', 'vol': 0.22}
+        ],
+        'cvd_forward_returns': [
+            {'horizon': '1d', 'avg_return': 0.005, 'win_rate': 0.52}
+        ]
+    }
+    success = sdb.save_backtest_results("MOCK_STOCK", results)
+    if success:
+        print("[+] Mock backtest results inserted successfully.")
+    else:
+        print("[-] Failed to insert mock backtest results.")
+    return success
+
 def test_read_macro_events():
     print("\n7. Testing macro_events read...")
     df = sdb.load_macro_events()
@@ -157,6 +214,8 @@ def main():
     all_ok &= test_gex_profiles()
     all_ok &= test_positioning_data()
     all_ok &= test_cvd_data()
+    all_ok &= test_intraday_predictions()
+    all_ok &= test_backtest_results()
     all_ok &= test_read_macro_events()
     
     print("\n" + "=" * 60)

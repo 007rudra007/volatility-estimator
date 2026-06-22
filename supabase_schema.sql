@@ -110,3 +110,40 @@ CREATE TABLE IF NOT EXISTS public.cvd_data (
 
 CREATE INDEX IF NOT EXISTS idx_cvd_ticker_timestamp 
 ON public.cvd_data (ticker, timestamp DESC);
+
+-- 7. Intraday Next-Day Price Predictions
+CREATE TABLE IF NOT EXISTS public.intraday_predictions (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    target_date DATE NOT NULL,
+    candle_time TEXT NOT NULL,
+    pred_price NUMERIC NOT NULL,
+    low_bound NUMERIC NOT NULL,
+    high_bound NUMERIC NOT NULL,
+    actual_price NUMERIC,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT unique_intraday_pred UNIQUE (ticker, target_date, candle_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intraday_pred_ticker_target 
+ON public.intraday_predictions (ticker, target_date DESC);
+
+-- 8. Quantitative Backtest Results
+CREATE TABLE IF NOT EXISTS public.backtest_results (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    cumulative_return NUMERIC,
+    benchmark_return NUMERIC,
+    sharpe_ratio NUMERIC,
+    max_drawdown NUMERIC,
+    win_rate NUMERIC,
+    trade_count INTEGER,
+    equity_curve JSONB,
+    trade_logs JSONB,
+    volatility_breaches JSONB,
+    cvd_forward_returns JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT unique_backtest_ticker UNIQUE (ticker)
+);

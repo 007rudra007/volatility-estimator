@@ -359,3 +359,95 @@ def load_macro_events() -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Error fetching macro events from Supabase: {e}")
         return pd.DataFrame()
+
+
+def save_intraday_predictions(ticker: str, predictions: list) -> bool:
+    """
+    Saves computed 15-minute next-day price path predictions to intraday_predictions table.
+    """
+    if not SUPABASE_ENABLED or client is None:
+        return False
+
+    try:
+        records = []
+        timestamp = get_current_timestamp_str()
+        for pred in predictions:
+            t_date = pred.get('target_date') or pred.get('date')
+            if hasattr(t_date, 'strftime'):
+                t_date_str = t_date.strftime('%Y-%m-%d')
+            else:
+                t_date_str = str(t_date) if t_date else None
+
+            rec = {
+                'ticker': ticker,
+                'timestamp': timestamp,
+                'target_date': t_date_str,
+                'candle_time': pred.get('candle_time') or pred.get('time'),
+                'pred_price': pred.get('pred_price'),
+                'low_bound': pred.get('low_bound'),
+                'high_bound': pred.get('high_bound'),
+                'actual_price': pred.get('actual_price')
+            }
+            records.append(sanitize_dict(rec))
+
+        if not records:
+            return True
+
+        client.table("intraday_predictions").upsert(records, on_conflict="ticker,target_date,candle_time").execute()
+        logger.info(f"Successfully saved {len(records)} intraday predictions to Supabase for {ticker}.")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving intraday predictions to Supabase: {e}")
+        return False
+
+
+def save_backtest_results(ticker: str, results: dict) -> bool:
+    """
+    Saves quantitative backtest simulation summary metrics and series to backtest_results table.
+    """
+    if not SUPABASE_ENABLED or client is None:
+        return False
+
+    try:
+        def serialize_field(field):
+            if isinstance(field, pd.DataFrame):
+                return field.reset_index().to_dict(orient='records')
+            elif isinstance(field, pd.Series):
+                return field.reset_index().to_dict(orient='records')
+            elif isinstance(field, list):
+                clean_list = []
+                for x in field:
+                    if isinstance(x, dict):
+                        # Convert timestamp objects to strings
+                        clean_list.append({
+                            k: (v.strftime('%Y-%m-%d %H:%M:%S') if hasattr(v, 'strftime') else
+                                (v.isoformat() if hasattr(v, 'isoformat') else v))
+                            for k, v in x.items()
+                        })
+                    else:
+                        clean_list.append(x)
+                return clean_list
+            return field
+
+        rec = {
+            'ticker': ticker,
+            'timestamp': get_current_timestamp_str(),
+            'cumulative_return': results.get('cumulative_return'),
+            'benchmark_return': results.get('benchmark_return'),
+            'sharpe_ratio': results.get('sharpe_ratio'),
+            'max_drawdown': results.get('max_drawdown'),
+            'win_rate': results.get('win_rate'),
+            'trade_count': results.get('trade_count'),
+            'equity_curve': serialize_field(results.get('equity_curve')),
+            'trade_logs': serialize_field(results.get('trade_logs')),
+            'volatility_breaches': serialize_field(results.get('volatility_breaches')),
+            'cvd_forward_returns': serialize_field(results.get('cvd_forward_returns'))
+        }
+        
+        sanitized = sanitize_dict(rec)
+        client.table("backtest_results").upsert(sanitized, on_conflict="ticker").execute()
+        logger.info(f"Successfully saved backtest results to Supabase for {ticker}.")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving backtest results to Supabase: {e}")
+        return False
